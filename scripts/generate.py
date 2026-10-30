@@ -2,14 +2,17 @@
 
     generate.py image  --prompt "..." --out frames/s01.png [--ref sheet.png] [--n 3] [--quality draft|standard|best]
     generate.py images jobs.json                          # several different images, one cost, one approval
-    generate.py video  --prompt "..." --out clips/s01.mp4 [--frame frames/s01.png] [--audio]
-    generate.py clips  <project> [--shots shots.json] [--only s03 s07] [--redo]
+    generate.py video  --prompt "..." --out clips/s01.mp4 [--frame frames/s01.png] [--audio] [--seconds 6]
+    generate.py clips  <project> [--shots shots.json] [--only s03 s07] [--redo] [--fit]
     generate.py voice  --text-file script.txt --out audio/vo.mp3 --voice <voice id>
     generate.py voices                                    # list voices to pick from (free)
     generate.py lipsync --video clips/s04.mp4 --audio audio/s04.mp3 --out clips/s04_talk.mp4
     generate.py avatar  --image frames/host.png --audio audio/vo.mp3 --out clips/host.mp4 [--prompt "..."]
+    generate.py music   --prompt "..." --out inputs/music.mp3 [--seconds 60]
 
 Paid jobs print the estimate and stop; add --yes to run them. --provider <name> forces an API adapter.
+Clips are --seconds long (default: the video slot's max_seconds, 8). `clips --fit` asks for each shot's own length
+plus a spare second instead, which costs less on providers that bill per second (Replicate, Higgsfield).
 
 Slot modes (providers.json):
   api     run it here with the adapter
@@ -29,13 +32,17 @@ import providers
 from common import check_spend, duration, load_settings, log_spend, mmss
 
 CLIP_TYPES = ("clip", "veo", "talking")      # shot types that need a generated clip ("veo" = old name)
+FIT_MARGIN = 1.0                             # --fit: a spare second per clip for trims and small re-timings
 
 
 def route(slot, forced=None):
     """Returns ("api", adapter, cfg) or exits with the right code for mcp / manual / none."""
     cfg = load_settings().get(slot, {})
     if forced:
-        return "api", providers.get(forced), cfg
+        p = providers.get(forced)
+        if slot not in p.slots:
+            sys.exit(f"{p.label} can't do {slot}. It does: {', '.join(p.slots)}")
+        return "api", p, cfg
     mode = cfg.get("mode", "none")
     if mode == "api":
         return "api", providers.get(cfg.get("provider", "")), cfg
@@ -191,12 +198,14 @@ def cmd_video(a):
         handoff(mode, "video", cfg, a.out, prompt, [a.frame] if a.frame else [],
                 {"aspect ratio": a.aspect, "length": f"{cfg.get('max_seconds', 8)}s",
                  "start frame": a.frame or "none", "sound": "on" if a.audio else "off (mute it)"})
-    confirm([(os.path.basename(a.out), p.estimate("video", quality, model=a.model or cfg.get("model")))], a.yes)
+    seconds = a.seconds or cfg.get("max_seconds", 8)
+    confirm([(os.path.basename(a.out), p.estimate("video", quality, seconds=seconds, model=a.model or cfg.get("model"),
+                                                  audio=a.audio))], a.yes)
 
     def one(o):
         os.makedirs(os.path.dirname(os.path.abspath(o)), exist_ok=True)
         keep_old(o)
-        return p.video(prompt, o, frame=a.frame, aspect=a.aspect, quality=quality, audio=a.audio,
+        return p.video(prompt, o, frame=a.frame, seconds=seconds, aspect=a.aspect, quality=quality, audio=a.audio,
                        model=a.model or cfg.get("model"))
     run_parallel([a.out], one, f"{p.name}-video")
 
@@ -231,15 +240,24 @@ def cmd_clips(a):
 
     default_q = a.quality or data.get("quality") or cfg.get("quality", "standard")
     model = a.model or cfg.get("model")
-    confirm([(f'{s["id"]} ({s.get("quality", default_q)})', p.estimate("video", s.get("quality", default_q), model=model))
-             for s in todo], a.yes)
+    longest = cfg.get("max_seconds", 8)
+    vo_len = duration(os.path.join(a.project, data["vo"])) if a.fit and data.get("vo") else 0
+
+    def seconds(s):
+        if not a.fit:
+            return longest
+        end = max(s["end"], vo_len) if s is data["shots"][-1] else s["end"]   # the edit runs the last shot to the VO's end
+        return min(longest, end - s["start"] + s.get("in", 0) + FIT_MARGIN)
+    confirm([(f'{s["id"]} ({s.get("quality", default_q)})',
+              p.estimate("video", s.get("quality", default_q), seconds=seconds(s), model=model,
+                         audio=s.get("type") == "talking")) for s in todo], a.yes)
 
     def one(s):
         out = os.path.join(clips_dir, s["id"] + ".mp4")
         os.makedirs(clips_dir, exist_ok=True)
         keep_old(out)
         frame = os.path.join(a.project, s["frame"]) if s.get("frame") else None
-        return p.video(s["video_prompt"], out, frame=frame, quality=s.get("quality", default_q),
+        return p.video(s["video_prompt"], out, frame=frame, seconds=seconds(s), quality=s.get("quality", default_q),
                        audio=s.get("type") == "talking", model=model)
     run_parallel(todo, one, f"{p.name}-video", label=lambda s: s["id"], project=a.project)
 
@@ -249,14 +267,17 @@ def cmd_voice(a):
     mode, p, cfg = route("voice", a.provider)
     if mode != "api":
         handoff(mode, "voice", cfg, a.out, text, (), {"voice": a.voice or cfg.get("voice_id", "pick one"),
-                                                      "model": a.model or cfg.get("model", "the most natural one")})
+                                                      "model": a.model or cfg.get("model", "the most natural one"),
+                                                      "language": a.language or "the script's language"})
     voice_id = a.voice or cfg.get("voice_id")
     if not voice_id:
         sys.exit("No voice chosen. List them with: generate.py voices")
-    confirm([(os.path.basename(a.out), None)], a.yes)
+    model = a.model or cfg.get("model") or p.model_for("voice", cfg.get("quality", "standard"))
+    confirm([(os.path.basename(a.out), p.estimate("voice", cfg.get("quality", "standard"), model=model,
+                                                  chars=len(text)))], a.yes)
     os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
     keep_old(a.out)
-    r = p.voice(text, a.out, voice_id, model=a.model or cfg.get("model"))
+    r = p.voice(text, a.out, voice_id, model=model, settings={"language": a.language} if a.language else None)
     print(f"saved {a.out}  ({mmss(duration(a.out))})")
     log_spend(f"{p.name}-voice", r.cost)
 
@@ -267,7 +288,8 @@ def cmd_lipsync(a):
     if mode != "api":
         handoff(mode, "lipsync", cfg, a.out, None, [a.video, a.audio],
                 {"job": "make the person in the video say the attached voiceover (keep the video's movement)"})
-    confirm([(os.path.basename(a.out), None)], a.yes)
+    # The lip-synced clip is as long as the line. Lip-sync and avatar share a slot, so only --model picks the model.
+    confirm([(os.path.basename(a.out), p.estimate("lipsync", quality, seconds=duration(a.audio), model=a.model))], a.yes)
     os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
     keep_old(a.out)
     run_parallel([a.out], lambda o: p.lipsync(a.video, a.audio, o, quality=quality, model=a.model), f"{p.name}-lipsync")
@@ -279,7 +301,9 @@ def cmd_avatar(a):
     if mode != "api":
         handoff(mode, "lipsync", cfg, a.out, a.prompt, [a.image, a.audio],
                 {"job": "turn the photo into a talking video that says the attached voiceover"})
-    confirm([(f"{os.path.basename(a.out)} ({mmss(duration(a.audio))} of talking)", None)], a.yes)
+    talk = duration(a.audio)
+    confirm([(f"{os.path.basename(a.out)} ({mmss(talk)} of talking)",
+              p.estimate("avatar", quality, seconds=talk, model=a.model))], a.yes)
     os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
     keep_old(a.out)
     run_parallel([a.out], lambda o: p.avatar(a.image, a.audio, o, prompt=a.prompt or "", quality=quality, model=a.model),
@@ -291,10 +315,12 @@ def cmd_music(a):
     if mode != "api":
         handoff(mode, "music", cfg, a.out, a.prompt + " Instrumental, no vocals.", (),
                 {"length": "at least as long as the ad", "vocals": "none (instrumental)"})
-    confirm([(os.path.basename(a.out), None)], a.yes)
+    model = a.model or cfg.get("model") or p.model_for("music", cfg.get("quality", "standard"))
+    confirm([(os.path.basename(a.out), p.estimate("music", cfg.get("quality", "standard"), seconds=a.seconds,
+                                                  model=model))], a.yes)
     os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
     keep_old(a.out)
-    run_parallel([a.out], lambda o: p.music(a.prompt, o, model=a.model), f"{p.name}-music")
+    run_parallel([a.out], lambda o: p.music(a.prompt, o, seconds=a.seconds, model=model), f"{p.name}-music")
 
 
 def cmd_voices(a):
@@ -310,6 +336,8 @@ def run_parallel(items, fn, what, label=os.path.basename, project=""):
     with cf.ThreadPoolExecutor(max_workers=4) as ex:
         futs = {ex.submit(fn, it): it for it in items}
         for f in cf.as_completed(futs):
+            if f.cancelled():
+                continue
             name = label(futs[f])
             try:
                 r = f.result()
@@ -319,6 +347,10 @@ def run_parallel(items, fn, what, label=os.path.basename, project=""):
             except providers.OutOfCredit as e:
                 print(f"{name}: STOPPED, {e}", flush=True)
                 failed += 1
+                for other in futs:             # don't start the jobs still waiting: they'd fail the same way
+                    if other.cancel():
+                        print(f"{label(futs[other])}: not started (out of credit)", flush=True)
+                        failed += 1
             except Exception as e:
                 print(f"{name}: FAILED, {e}", flush=True)
                 failed += 1
@@ -349,20 +381,24 @@ def main():
     v = sub.add_parser("video"); common(v)
     v.add_argument("--prompt"); v.add_argument("--prompt-file"); v.add_argument("--out", required=True)
     v.add_argument("--frame"); v.add_argument("--aspect", default="9:16"); v.add_argument("--audio", action="store_true")
+    v.add_argument("--seconds", type=float, help="clip length (default: max_seconds from providers.json, 8)")
     v.add_argument("--quality", choices=("draft", "standard", "best"))
 
     c = sub.add_parser("clips"); common(c)
     c.add_argument("project"); c.add_argument("--shots", default="shots.json")
     c.add_argument("--only", nargs="*"); c.add_argument("--redo", action="store_true")
+    c.add_argument("--fit", action="store_true", help="ask for each shot's own length (+1s), not max_seconds")
     c.add_argument("--quality", choices=("draft", "standard", "best"))
 
     vo = sub.add_parser("voice"); common(vo)
     vo.add_argument("--text-file", required=True); vo.add_argument("--out", required=True); vo.add_argument("--voice")
+    vo.add_argument("--language", help="the script's language code, e.g. fr (some voice models assume English)")
 
     vs = sub.add_parser("voices"); vs.add_argument("--provider")
 
     mu = sub.add_parser("music"); common(mu)
     mu.add_argument("--prompt", required=True); mu.add_argument("--out", required=True)
+    mu.add_argument("--seconds", type=float, help="track length, at least as long as the ad (provider default if unset)")
 
     ls = sub.add_parser("lipsync"); common(ls)
     ls.add_argument("--video", required=True); ls.add_argument("--audio", required=True)

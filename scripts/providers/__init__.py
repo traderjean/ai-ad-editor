@@ -1,10 +1,13 @@
 """Registry of API adapters. To add one: drop a file here with a Provider subclass and add it to ALL."""
 from ._base import OutOfCredit, Provider, ProviderError, Result
 from .elevenlabs import ElevenLabs
+from .higgsfield import Higgsfield
 from .kie import Kie
+from .replicate import Replicate
 
-# Order = preference when setup fills slots automatically (a direct ElevenLabs key wins the voice slot).
-ALL = {p.name: p for p in (ElevenLabs, Kie)}
+# Order = preference when setup fills slots automatically (a direct ElevenLabs key wins the voice slot,
+# then Kie, then Replicate, then Higgsfield).
+ALL = {p.name: p for p in (ElevenLabs, Kie, Replicate, Higgsfield)}
 
 
 def get(name):

@@ -47,7 +47,10 @@ class ElevenLabs(Provider):
     def voice(self, text, out, voice_id, model=None, settings=None):
         s = {"stability": 0.5, "similarity_boost": 0.75, "speed": 1.0}
         s.update(settings or {})
+        language = s.pop("language", None)
         body = {"text": text, "model_id": model or "eleven_v3", "voice_settings": s}
+        if language and "v2_5" in body["model_id"]:      # only the v2.5 models take a forced language; v3 detects it
+            body["language_code"] = language
         url = f"{API}/v1/text-to-speech/{urllib.parse.quote(voice_id)}?output_format=mp3_44100_128"
         audio = with_retries(lambda: http("POST", url, headers=self._h(), body=body, timeout=600, want="bytes"))
         if not audio:

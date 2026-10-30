@@ -1,0 +1,132 @@
+[
+ {
+  "id": "Rachel",
+  "name": "Rachel",
+  "description": "Female, young, American - calm, clear narrator"
+ },
+ {
+  "id": "Drew",
+  "name": "Drew",
+  "description": "Male, middle-aged, American - well-rounded, news-style"
+ },
+ {
+  "id": "Clyde",
+  "name": "Clyde",
+  "description": "Male, middle-aged, American - gravelly character voice"
+ },
+ {
+  "id": "Paul",
+  "name": "Paul",
+  "description": "Male, middle-aged, American - authoritative reporter"
+ },
+ {
+  "id": "Aria",
+  "name": "Aria",
+  "description": "Female, middle-aged, American - husky, expressive"
+ },
+ {
+  "id": "Domi",
+  "name": "Domi",
+  "description": "Female, young, American - strong, assertive"
+ },
+ {
+  "id": "Dave",
+  "name": "Dave",
+  "description": "Male, young, British (Essex) - conversational"
+ },
+ {
+  "id": "Roger",
+  "name": "Roger",
+  "description": "Male, middle-aged, American - confident, laid-back"
+ },
+ {
+  "id": "Fin",
+  "name": "Fin",
+  "description": "Male, old, Irish - sailor character voice"
+ },
+ {
+  "id": "Sarah",
+  "name": "Sarah",
+  "description": "Female, young, American - soft, reassuring"
+ },
+ {
+  "id": "James",
+  "name": "James",
+  "description": "Male - husky, engaging and bold"
+ },
+ {
+  "id": "Jane",
+  "name": "Jane",
+  "description": "Female, middle-aged, British - audiobook reader"
+ },
+ {
+  "id": "Juniper",
+  "name": "Juniper",
+  "description": "Female, American - grounded and professional"
+ },
+ {
+  "id": "Arabella",
+  "name": "Arabella",
+  "description": "Female, young - mysterious and emotive"
+ },
+ {
+  "id": "Hope",
+  "name": "Hope",
+  "description": "Female, young, American - upbeat, bright"
+ },
+ {
+  "id": "Bradford",
+  "name": "Bradford",
+  "description": "Male, British - expressive and articulate"
+ },
+ {
+  "id": "Reginald",
+  "name": "Reginald",
+  "description": "Male - dark, dramatic villain character"
+ },
+ {
+  "id": "Gaming",
+  "name": "Gaming",
+  "description": "Male - energetic streamer character"
+ },
+ {
+  "id": "Austin",
+  "name": "Austin",
+  "description": "Male, American Southern - deep, raspy"
+ },
+ {
+  "id": "Kuon",
+  "name": "Kuon",
+  "description": "Female - cheerful, clear and steady"
+ },
+ {
+  "id": "Blondie",
+  "name": "Blondie",
+  "description": "Female, British - warm, conversational"
+ },
+ {
+  "id": "Priyanka",
+  "name": "Priyanka",
+  "description": "Female, Indian English - calm, neutral"
+ },
+ {
+  "id": "Alexandra",
+  "name": "Alexandra",
+  "description": "Female, young, American - conversational, real"
+ },
+ {
+  "id": "Monika",
+  "name": "Monika",
+  "description": "Female, Indian English - deep and natural"
+ },
+ {
+  "id": "Mark",
+  "name": "Mark",
+  "description": "Male, young, American - casual, relaxed"
+ },
+ {
+  "id": "Grimblewood",
+  "name": "Grimblewood",
+  "description": "Male, old, British - snarky gnome character"
+ }
+]

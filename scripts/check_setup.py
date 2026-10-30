@@ -2,9 +2,10 @@
 
     check_setup.py                         show slots, API keys found, local tools
     check_setup.py --auto                  fill empty slots with the API keys found
-    check_setup.py --set video=api:kie     choose a tool for a slot
+    check_setup.py --set video=api:kie     choose a tool for a slot (api:kie, api:replicate, api:higgsfield, ...)
     check_setup.py --set video=mcp:<tool name> --set music=manual:Suno --set lipsync=none
     check_setup.py --set image=api:kie:nano-banana-pro      (pin a model)
+    check_setup.py --set video=api:replicate:google/veo-3.1-fast --set image=mcp:higgsfield
     check_setup.py --voice-id <id>         save the chosen voice
     check_setup.py --limit 15              block any single run over $15 (--limit 0 removes it)
 
@@ -59,16 +60,17 @@ if a.limit is not None:
 # ---- API keys ----
 print("API keys found")
 working = {}
+col = max(len(c.label) for c in providers.ALL.values()) + 1
 for name, cls in providers.ALL.items():          # registry order = preference order for --auto
     p = cls()
     if not p.has_key():
-        print(f"  {p.label:40} no key ({p.env_key}, get one at {p.signup})")
+        print(f"  {p.label:{col}} no key ({p.env_key}, get one at {p.signup})")
         continue
     try:
-        print(f"  {p.label:40} {p.check()}")
+        print(f"  {p.label:{col}} {p.check()}")
         working[name] = p
     except Exception as e:
-        print(f"  {p.label:40} KEY PROBLEM: {e}")
+        print(f"  {p.label:{col}} KEY PROBLEM: {e}")
 
 if a.auto:
     for slot in SLOTS:
