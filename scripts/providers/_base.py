@@ -12,10 +12,11 @@ import urllib.request
 
 
 class ProviderError(Exception):
-    def __init__(self, msg, code=None, retry=False):
+    def __init__(self, msg, code=None, retry=False, rejected=False):
         super().__init__(msg)
         self.code = code
-        self.retry = retry      # True = busy / rate-limited, worth trying again
+        self.retry = retry or rejected      # True = busy / rate-limited, worth trying again
+        self.rejected = rejected            # True = turned away before anything started (safe to resend a paid job)
 
 
 class OutOfCredit(ProviderError):
@@ -61,8 +62,8 @@ class Provider:
             return override
         return self.default_models.get(slot, {}).get(quality)
 
-    def estimate(self, slot, quality, seconds=None, model=None):
-        """USD per item, or None if unknown."""
+    def estimate(self, slot, quality, seconds=None, model=None, audio=False, chars=None):
+        """USD per item, or None if unknown. seconds = clip or audio length, chars = voiceover length."""
         return None
 
     # ---- slots (implement the ones listed in `slots`) ----
@@ -107,16 +108,25 @@ def http(method, url, headers=None, body=None, raw=None, timeout=120, want="json
         msg = e.read().decode(errors="replace")[:500]
         if e.code == 402:
             raise OutOfCredit(f"Out of credit ({e.code}): {msg}", code=402)
-        raise ProviderError(f"HTTP {e.code}: {msg}", code=e.code, retry=e.code in (429, 500, 502, 503, 504))
+        raise ProviderError(f"HTTP {e.code}: {msg}", code=e.code, retry=e.code in (500, 502, 503, 504),
+                            rejected=e.code == 429)
     except urllib.error.URLError as e:
         raise ProviderError(f"Network error: {e.reason}", retry=True)
     except (ConnectionError, TimeoutError, OSError) as e:      # e.g. "connection reset by peer"
         raise ProviderError(f"Network error: {e}", retry=True)
-    return json.loads(data) if want == "json" else data
+    if want != "json":
+        return data
+    if not data.strip():
+        return {}                                            # e.g. 202/204 with no body
+    try:
+        return json.loads(data)
+    except ValueError:                                       # an HTML error page from a proxy, a cut-off reply
+        raise ProviderError(f"Expected JSON from {url}, got: {data[:200]!r}", retry=True)
 
 
 def with_retries(fn, tries=5, base_wait=10):
-    """Run fn(); on a retryable error wait and try again (rejected calls are normally not billed)."""
+    """Run fn(); on a retryable error wait and try again. Only for calls that are safe to repeat
+    (status checks, uploads). A call that starts a paid job goes through submit() instead."""
     for attempt in range(tries):
         try:
             return fn()
@@ -124,6 +134,23 @@ def with_retries(fn, tries=5, base_wait=10):
             if not e.retry or attempt == tries - 1:
                 raise
             time.sleep(base_wait * (attempt + 1))
+
+
+def submit(fn, tries=5, base_wait=10):
+    """Run fn(), a call that starts a paid job. Retried only when the provider turned it away (rate limit,
+    busy): nothing was made. After a network error or a server error the job may already exist and be
+    billing, so it stops and says so instead of paying twice."""
+    for attempt in range(tries):
+        try:
+            return fn()
+        except ProviderError as e:
+            if e.rejected and attempt < tries - 1:
+                time.sleep(base_wait * (attempt + 1))
+                continue
+            if e.retry and not e.rejected:
+                raise ProviderError(f"{e}. The job may have started anyway: check the provider's dashboard "
+                                    f"before running it again, so it isn't paid for twice.", code=e.code) from e
+            raise
 
 
 def download(url, out, tries=4):
@@ -137,6 +164,8 @@ def download(url, out, tries=4):
                 f.write(data)
             return out
         except (urllib.error.URLError, ConnectionError, TimeoutError, OSError) as e:
-            if attempt == tries - 1:
-                raise ProviderError(f"Made, but the download failed ({e}). The file is still at: {url}")
+            gone = isinstance(e, urllib.error.HTTPError) and e.code in (401, 403, 404, 410)   # retrying won't help
+            if gone or attempt == tries - 1:
+                raise ProviderError(f"Made, but the download failed ({e}). The file may still be at: {url} "
+                                    f"(providers delete results after a while, so save it soon)")
             time.sleep(5 * (attempt + 1))

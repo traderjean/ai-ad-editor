@@ -11,7 +11,7 @@ import os
 import time
 import uuid
 
-from ._base import OutOfCredit, Provider, ProviderError, Result, download, http, with_retries
+from ._base import OutOfCredit, Provider, ProviderError, Result, download, http, submit, with_retries
 
 API = "https://api.kie.ai/api/v1"
 UPLOAD = "https://kieai.redpandaai.co/api/file-stream-upload"
@@ -38,7 +38,8 @@ class Kie(Provider):
 
     # ---- low level ----
 
-    def _req(self, method, url, body=None, raw=None, headers=None):
+    def _req(self, method, url, body=None, raw=None, headers=None, paid=False):
+        """paid=True for a call that starts a paid task: it is only resent when Kie turned it away."""
         h = {"Authorization": f"Bearer {self.key()}"}
         h.update(headers or {})
 
@@ -49,9 +50,10 @@ class Kie(Provider):
                 msg = d.get("msg") or d
                 if str(code) == "402":
                     raise OutOfCredit(f"Kie credits have run out. Top up at kie.ai/billing. ({msg})", code=402)
-                raise ProviderError(f"Kie {code}: {msg}", code=code, retry=str(code) in ("429", "455", "503"))
+                # 429 / 455 / 503 = Kie is busy and turned the request away, so nothing was made.
+                raise ProviderError(f"Kie {code}: {msg}", code=code, rejected=str(code) in ("429", "455", "503"))
             return d
-        return with_retries(once)
+        return (submit if paid else with_retries)(once)
 
     def credits(self):
         return float(self._req("GET", f"{API}/chat/credit").get("data") or 0)
@@ -74,14 +76,20 @@ class Kie(Provider):
         return data.get("downloadUrl") or data.get("fileUrl")
 
     def _run(self, model, inp, timeout=900, every=8):
-        """createTask + poll, retried when Kie says it's busy. Returns (result_urls, usd or None)."""
+        """createTask + poll, made again only when the task failed because Kie was busy (failed tasks aren't
+        charged). Returns (result_urls, usd or None)."""
         return with_retries(lambda: self._run_once(model, inp, timeout, every), tries=4, base_wait=30)
 
     def _run_once(self, model, inp, timeout, every):
-        task = self._req("POST", f"{API}/jobs/createTask", {"model": model, "input": inp})["data"]["taskId"]
+        task = self._req("POST", f"{API}/jobs/createTask", {"model": model, "input": inp}, paid=True)["data"]["taskId"]
         t0 = time.time()
         while True:
-            d = self._req("GET", f"{API}/jobs/recordInfo?taskId={task}")["data"]
+            try:
+                d = self._req("GET", f"{API}/jobs/recordInfo?taskId={task}")["data"]
+            except ProviderError as e:
+                # The task exists and may still finish (and be charged): never start a second one from here.
+                raise ProviderError(f"Lost track of Kie task {task} ({e}). It may still finish: check the logs "
+                                    f"at kie.ai before running it again.", code=e.code) from e
             state = d.get("state")
             if state == "success":
                 res = d.get("resultJson") or "{}"
@@ -109,12 +117,12 @@ class Kie(Provider):
         bal = self.credits()
         return f"key OK, balance {bal:.0f} credits (${bal * USD_PER_CREDIT:.2f})"
 
-    def estimate(self, slot, quality, seconds=None, model=None):
+    def estimate(self, slot, quality, seconds=None, model=None, audio=False, chars=None):
         m = self.model_for(slot, quality, model)
-        return (VIDEO_EST if slot == "video" else IMAGE_EST).get(m)
+        return {"video": VIDEO_EST, "image": IMAGE_EST}.get(slot, {}).get(m)
 
     def image(self, prompt, out, refs=(), aspect="9:16", quality="standard", model=None):
-        m = self.model_for("image", quality, model)
+        m = est = self.model_for("image", quality, model)
         urls = [self.upload(p) for p in refs]
         inp = {"prompt": prompt, "output_format": "png"}
         if m.startswith("google/nano-banana"):       # the older model has a separate edit endpoint
@@ -130,7 +138,7 @@ class Kie(Provider):
         if not res:
             raise ProviderError("Kie returned no image")
         download(res[0], out)
-        return Result([out], usd if usd is not None else IMAGE_EST.get(m), m)
+        return Result([out], usd if usd is not None else IMAGE_EST.get(est), m)
 
     def video(self, prompt, out, frame=None, seconds=8, aspect="9:16", quality="standard", audio=False, model=None):
         m = self.model_for("video", quality, model)
@@ -142,11 +150,13 @@ class Kie(Provider):
         else:
             inp["generation_type"] = "TEXT_2_VIDEO"
         # Veo sometimes refuses with "unable to generate audio" even when we mute it later. Failed tasks
-        # aren't charged, so try: as asked -> without the no-audio line -> the other Veo models.
+        # aren't charged, so try: as asked -> without the no-audio line -> the other Veo models that cost no
+        # more than the one the user approved (never a dearer model behind their back).
         tries = [(m, inp["prompt"])]
         if not audio:
             tries.append((m, prompt))
-        tries += [(alt, prompt) for alt in ("veo3_lite", "veo3_fast", "veo3") if alt != m]
+        cap = VIDEO_EST.get(m, 0)
+        tries += [(alt, prompt) for alt in ("veo3_lite", "veo3_fast", "veo3") if alt != m and VIDEO_EST[alt] <= cap]
         last = None
         for model_id, text in tries:
             try:

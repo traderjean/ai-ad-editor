@@ -1,6 +1,6 @@
 ---
 name: ai-ad-editor
-description: Turn a finished ad script into a finished short-form video ad (9:16, plus 4:5, 1:1 and 16:9 if wanted) from AI-generated clips, the user's own clip library (UGC), or both - voiceover, shot plan, library clip matching, characters, scene images, AI video clips, talking characters with lip-sync, edit, captions, music, hook variants, quality checks and export. Works with any generation tools - an MCP, built for Kie.ai (images, video and lip-sync) with ElevenLabs for the voiceover, or other APIs, or by hand with copy-paste prompts. Nothing paid runs without your yes. Use when the user says "edit this ad", "make the video", "turn this script into an ad", "video ad from this script", "AI ad editor", "make hook variants", or brings a script (and maybe a voiceover or avatar clip) and wants a finished video ad.
+description: Turn a finished ad script into a finished short-form video ad (9:16, plus 4:5, 1:1 and 16:9 if wanted) from AI-generated clips, the user's own clip library (UGC), or both - voiceover, shot plan, library clip matching, characters, scene images, AI video clips, talking characters with lip-sync, edit, captions, music, hook variants, quality checks and export. Works with any generation tools - built for Kie.ai (images, video and lip-sync) with ElevenLabs for the voiceover, also Replicate (every slot) and Higgsfield (images and video by API, or its MCP), any other MCP or API, or by hand with copy-paste prompts. Nothing paid runs without your yes. Use when the user says "edit this ad", "make the video", "turn this script into an ad", "video ad from this script", "AI ad editor", "make hook variants", or brings a script (and maybe a voiceover or avatar clip) and wants a finished video ad.
 ---
 
 # AI Ad Editor
@@ -49,14 +49,15 @@ Takes a finished script and makes the finished video ad. The script is never rew
 Free. Keep it short: the user wants to make an ad, not configure software.
 
 1. Run `python3 $S/check_setup.py` quietly. Don't show its output.
-2. **Already set up** (`providers.json` filled): one line, "You're set up with Kie, same as last time." Move on.
-3. **First time:** say what's needed in plain words: "To make the images and clips I need one AI generation account. The easiest is a Kie.ai API key: one key and one balance for images, video and lip-sync." Then ask with buttons:
+2. **Already set up** (`providers.json` filled): one line naming what each slot uses, e.g. "You're set up with Kie, same as last time." Move on.
+3. **First time:** say what's needed in plain words: "To make the images and clips I need one AI generation account. The easiest is a Kie.ai API key: one key and one balance for images, video and lip-sync." Then ask with buttons (the free "Other" answer covers another MCP or API, or running the prompts by hand):
    - **Kie.ai API key (Recommended).** If `KIE_API_KEY` works, confirm "Kie is connected, balance $X" and move on. If not, tell them how to get one and add it to their shell profile.
-   - **Another tool I already use.** An MCP they've connected, or another API key. Check it and use it.
-   - **No API, I'll run the prompts myself.** Manual mode: you write every prompt, they run it in any app.
-4. Save it: `python3 $S/check_setup.py --auto` (or `--set image=api:kie --set video=api:kie --set lipsync=api:kie`, `--set video=mcp:<tool name>`, `--set video=manual:<app>`).
+   - **Replicate API token.** Pay per result, every slot (images, video, voice, music, lip-sync, avatars). If `REPLICATE_API_TOKEN` works, confirm "Replicate is connected (account X)". Replicate shows no balance through its API: point them to replicate.com/account/billing. If not set, tell them to make a token at replicate.com/account/api-tokens and add it to their shell profile.
+   - **Higgsfield.** Two ways, check both: the **API** (`HF_KEY="<key id>:<secret>"` from console.higgsfield.ai, API keys) makes images and video; the **Higgsfield MCP**, if it's connected in this Claude (tools named `mcp__higgsfield__*`), also does voiceovers and lip-sync, paid in Higgsfield credits (see "Higgsfield MCP" below). Neither makes music: that slot goes to another provider or by hand.
+   - **Another tool or by hand.** An MCP they've connected, or another API key: check it and use it. Or manual mode: you write every prompt, they run it in any app.
+4. Save it: `python3 $S/check_setup.py --auto` fills every empty slot from the keys that work (Kie first, then Replicate, then Higgsfield). Or set slots one by one: `--set image=api:replicate --set video=api:replicate --set lipsync=api:replicate`, `--set video=api:higgsfield`, `--set video=mcp:higgsfield`, `--set video=mcp:<tool name>`, `--set video=manual:<app>`. Slots can mix providers (e.g. Higgsfield video, Replicate music).
 5. **Don't ask about voice, music or lip-sync now.** Each comes up in its own step, only if the ad needs it.
-6. **Models are a choice, not a rule.** When clips come up (Step 8), recommend Veo 3.1 Fast as the place to start (good motion, fair price). On Kie, the built-in video models are the Veo 3.1 family (`veo3_lite`, `veo3_fast`, `veo3`), set with `--quality` or `check_setup.py --set video=api:kie:<model id>`. Other video models (Kling, Seedance and so on) need their own few lines in `scripts/providers/kie.py` before they work; through an MCP or by hand, any model the user has works. Same for images: Nano Banana 2 to start, any other image model if they prefer.
+6. **Models are a choice, not a rule.** When clips come up (Step 8), recommend Veo 3.1 Fast as the place to start (good motion, fair price). `--quality draft|standard|best` picks the provider's model for each tier (table below); `check_setup.py --set video=api:<provider>:<model id>` pins any model the adapter knows. On Kie, the built-in video models are the Veo 3.1 family (`veo3_lite`, `veo3_fast`, `veo3`); other Kie video models (Kling, Seedance and so on) need their own few lines in `scripts/providers/kie.py` before they work. Through an MCP or by hand, any model the user has works. Same for images: Nano Banana 2 to start (Nano Banana 2.1 on Replicate), any other image model if they prefer.
 7. Only if ffmpeg or faster-whisper is missing, give the one install line `check_setup.py` prints.
 
 **How each mode works from here on.** Every generation goes through `generate.py`:
@@ -68,6 +69,27 @@ Free. Keep it short: the user wants to make an ad, not configure software.
 | `manual` | Exits with code 4 and writes `manual/<name>.md` | Tell the user which file to open; wait for them to drop the result where it says |
 
 Every rule and approval stays the same in every mode. In manual mode, "approve" means approving the prompt before they run it.
+
+**Which model each provider uses** (`--quality`, default standard):
+
+| Slot | Kie | Replicate | Higgsfield API |
+|---|---|---|---|
+| image | Nano Banana / Nano Banana 2 / Nano Banana Pro | Nano Banana 2.1 1K / Nano Banana 2.1 2K / Nano Banana Pro | Qwen Image 3 1K / Qwen Image 3 2K / GPT Image 2.5 Flare |
+| video | Veo 3.1 Lite / Fast / Full, always 8s | Seedance 1 Pro Fast / Veo 3.1 Fast / Veo 3.1, sound off, billed per second | Wan 3.0 720p / Wan 3.0 1080p / Kling 3.0 Pro, sound off, billed per second |
+| voice | ElevenLabs v3 (fixed voice list) | ElevenLabs Turbo v2.5 / v3 / v3 (26 named voices) | none (MCP only) |
+| music | Suno, 2 takes | Stable Audio 2.5 / ElevenLabs Music, exact length | none |
+| lip-sync | Volcengine lite / lite / basic | PixVerse / Sync Lipsync 2 / Sync Lipsync 2 Pro, billed per second of the line | none (MCP only) |
+| avatar | InfiniteTalk / Kling Avatar Standard / Pro | Pruna P-Video 2 Pro Avatar / Kling Avatar v2 std / Kling Avatar v2 pro, billed per second | none |
+
+On Replicate and Higgsfield, video is billed per second: `generate.py clips --fit` asks for each shot's own length plus a spare second instead of 8s (cheaper; the trade-off is that lengthening a shot later can mean a paid remake). Neither shows a balance through its API, so `check_setup.py` only confirms the key works. Higgsfield's best image and video tiers have no published price: `generate.py` shows "cost unknown" for them; say so before the run.
+
+**Higgsfield MCP** (`--set <slot>=mcp:higgsfield`). `generate.py` exits with code 3 and prints the prompt and settings; you run the job with the Higgsfield tools and save the file to the path it printed:
+1. Once per conversation: `mcp__higgsfield__get_preferences` (and `balance` to show their credits).
+2. Upload each local file it lists (start frame, references, clip, voiceover): `media_upload` with the filename and content type, a `curl -X PUT --upload-file` to the returned upload URL (must answer 200), then `media_confirm` per media type. A finished Higgsfield job can be passed on by its job id instead. `medias` values are always media or job ids, never URLs.
+3. Price it first with the single tool and `get_cost: true` (e.g. `generate_video` with `{model, prompt, aspect_ratio: "9:16", duration, medias, get_cost: true}`). Quote the credits it returns and wait for a yes. It's priced in credits, not dollars: say so.
+4. Submit with the batch tool (`generate_image_batch`, `generate_video_batch`, `generate_audio_batch`, even for one job), then `jobs_wait` (up to 12 jobs, 15s per call) until every job is done. Never resubmit after a timeout: keep the job ids and wait on them, or it is paid twice. Apply any `adjustments` the server returns.
+5. Save each result with `curl -L --fail -o <path it printed> <result url>`; mute a clip that must be silent (`ffmpeg -i in.mp4 -c:v copy -an out.mp4`).
+Models by tier: images `nano_banana` / `nano_banana_2` / `nano_banana_pro` (role `image_references`); video `veo3_1_lite` / `veo3_1` (variant `veo-3-1-fast`) / `kling3_0` (mode `pro`, `sound: "off"`), start frame as role `start_image`; voiceover `seed_audio` or `elevenlabs_v4` with a voice from `list_voices` (`voice_type` + `voice_id`, `format: "mp3"`); lip-sync `sync_so` (roles `input_video` + `input_audio`, `sync_mode: "bounce"`); avatar: make a clip of the photo first, then lip-sync it with `sync_so`. No music.
 
 ---
 
@@ -119,9 +141,9 @@ Use the option from the brief. If it's missing, ask with buttons.
 **1. I have the voiceover.** Copy it to `inputs/vo.mp3` (or `.wav`). Show its length (m:ss).
 
 **2. Generate it.**
-- Voice slot. List voices with `python3 $S/generate.py voices` and pick 3 that fit the buyer (age, gender, accent). Offer them with buttons, one line each. On Kie the voices are a fixed list of ElevenLabs v3 voices; a user who wants their own ElevenLabs voices sets `check_setup.py --set voice=api:elevenlabs` with an ElevenLabs key.
+- Voice slot. List voices with `python3 $S/generate.py voices` and pick 3 that fit the buyer (age, gender, accent). Offer them with buttons, one line each. On Kie the voices are a fixed list of ElevenLabs v3 voices, and on Replicate a fixed list of 26 named ElevenLabs voices; a user who wants their own ElevenLabs voices sets `check_setup.py --set voice=api:elevenlabs` with an ElevenLabs key. On the Higgsfield MCP, list voices with `mcp__higgsfield__list_voices`.
 - Save the script as plain text (`inputs/script.txt`) and make one take:
-  `python3 $S/generate.py voice --text-file inputs/script.txt --out audio/vo.mp3 --voice <id>` (estimate, then `--yes`).
+  `python3 $S/generate.py voice --text-file inputs/script.txt --out audio/vo.mp3 --voice <id>` (estimate, then `--yes`). For a script that isn't in English, add `--language <code>` (e.g. `fr`): Replicate's voices otherwise assume English.
 - Show the length. The user listens and approves, or asks for another voice.
 - Save the chosen voice: `check_setup.py --voice-id <id>`, so hooks and later ads match.
 
@@ -268,15 +290,15 @@ Make the first frame as a test (`generate.py image`). After a yes, put the rest 
 Library mode: skip this step. Mixed mode: the AI rows only.
 
 1. Write each clip's `video_prompt` in `shots.json`: the camera, the movement, one action, the light, in plain words. For `talking` shots made by the video tool, put the exact line in quotes: `she looks at the camera and says: "<line>"`.
-2. Run `python3 $S/generate.py clips <project>` for the estimate. Make 1 or 2 test clips first (`--only s01 s02`), then the rest after a yes. It skips clips that already exist; `--only` remakes the named ones and keeps the old take as `<id>_prev.mp4`.
+2. Run `python3 $S/generate.py clips <project>` for the estimate. Make 1 or 2 test clips first (`--only s01 s02`), then the rest after a yes. It skips clips that already exist; `--only` remakes the named ones and keeps the old take as `<id>_prev.mp4`. On a provider that bills per second (Replicate, Higgsfield), offer `--fit` with both prices: each clip is its shot's length plus a spare second instead of 8s.
 3. **Check every clip yourself** before showing anything: `python3 $S/contact_sheet.py <project>` writes `qc/contact_sheet.jpg`. Look for warped hands, the face changing, objects changing shape, text appearing, the wrong product. For any clip it flags with a frozen start, set `"in": <seconds>` on that shot so the edit starts after it.
 4. **Talking shots:**
    - **Same-voice route:** cut each talking shot's part out of the voiceover (`audio/<id>.mp3`, using the times in `words.json`), then
      `python3 $S/generate.py lipsync --video clips/<id>.mp4 --audio audio/<id>.mp3 --out clips/<id>_talk.mp4`
-     and point the shot at the lip-synced file with `"clip": "clips/<id>_talk.mp4"`. Use the part of the clip where the person faces the camera (cut it out first if they only turn to the camera partway through).
+     and point the shot at the lip-synced file with `"clip": "clips/<id>_talk.mp4"`. Use the part of the clip where the person faces the camera (cut it out first if they only turn to the camera partway through). The lip-synced clip is as long as the line: a longer clip is trimmed, a shorter one plays back and forth. Replicate's Sync models move only a mouth that is already moving, so the clip should show the person talking (talking shots are made that way), not a still face.
    - **Video-tool-voice route:** transcribe every talking clip and compare it with its line. Any changed word is flagged to the user with the clip id; the user decides whether to remake it.
 5. Show the user the contact sheet and the list of clips you suggest remaking, with the reason for each. Remake only on a yes.
-6. Veo sometimes refuses a clip with "unable to generate audio". `generate.py` retries by itself (without the no-audio line, then on the other Veo models; refused tries aren't charged) and notes which model made it. If every try is refused, reword the prompt as below.
+6. On Kie, Veo sometimes refuses a clip with "unable to generate audio". `generate.py` retries by itself (without the no-audio line, then on the other Veo models that cost the same or less; refused tries aren't charged) and notes which model made it. If every try is refused, reword the prompt as below. Replicate and Higgsfield turn the sound off instead, so this doesn't come up there.
 7. If a clip is blocked (usually a safety filter on a person + a medical detail), soften the prompt and say what you changed. If credit runs out, stop, say so, and offer to finish the edit with the start frames as stills for the missing shots.
 
 ⛔ **Gate:** the user approves the clips (or says they don't need to see them).
@@ -285,7 +307,7 @@ Library mode: skip this step. Mixed mode: the AI rows only.
 
 ## Stage 8 — Edit (Step 9 of 10)
 
-1. **Music (always ask, never default to none).** Before the first edit, ask with buttons, with no option marked as recommended (music is taste): "Music under the ad?" Attach a track / Two tracks, switching at a line / Make a backing track for this concept / No music. "Make a backing track" writes a short mood prompt from the concept and makes 2 instrumental takes with Suno through Kie (`generate.py music --prompt "..." --out inputs/music.mp3`, about 6¢); the user picks one. Without Kie, it uses whatever music tool fills the music slot; otherwise write a short music prompt (mood, tempo, instruments, "instrumental, no vocals") for them to run in any music app and drop the file into `inputs/`. Save the answer to house rules so the next ad asks only to confirm.
+1. **Music (always ask, never default to none).** Before the first edit, ask with buttons, with no option marked as recommended (music is taste): "Music under the ad?" Attach a track / Two tracks, switching at a line / Make a backing track for this concept / No music. "Make a backing track" writes a short mood prompt from the concept and runs `generate.py music --prompt "..." --out inputs/music.mp3 --seconds <ad length + 2>`: on Kie, 2 instrumental takes with Suno (about 6¢) and the user picks one; on Replicate, one instrumental take of exactly that length (estimate first). Otherwise it uses whatever music tool fills the music slot (Higgsfield has none); otherwise write a short music prompt (mood, tempo, instruments, "instrumental, no vocals") for them to run in any music app and drop the file into `inputs/`. Save the answer to house rules so the next ad asks only to confirm.
 2. `python3 $S/edit.py <project> --preview` for a fast low-res check, then `python3 $S/edit.py <project>` for the full export.
 3. What the edit does: cuts every clip to its exact slot, frame-accurate, at 1080x1920; the voiceover is the only voice (or, on the talking-characters route where the video tool makes the voice, the clips' own voices); music sits under it and dips automatically while someone speaks (`"duck": false` turns that off); captions from `words.json`; end card if picked.
 4. **Captions** use the preset from the brief:

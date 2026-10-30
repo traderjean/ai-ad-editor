@@ -1,6 +1,6 @@
 # AI Ad Editor
 
-**A free Claude skill that turns your ad script into a finished video ad, from AI clips, your own clip library, or both. Built for [Kie.ai](https://kie.ai).**
+**A free Claude skill that turns your ad script into a finished video ad, from AI clips, your own clip library, or both. Built for [Kie.ai](https://kie.ai), and also works with [Replicate](https://replicate.com) and [Higgsfield](https://higgsfield.ai).**
 
 Paste a script. Claude plans every shot, makes the characters, images, clips and voiceover with the AI tools you already use (or finds the right clips in your library), cuts it to the voiceover with captions and music, and checks every file before it hands it over. You approve each step in chat, and nothing that costs money runs without your yes.
 
@@ -40,9 +40,18 @@ Paste a script. Claude plans every shot, makes the characters, images, clips and
 - **Write your house rules once.** Fill in [`house-rules-template.md`](house-rules-template.md): approvals, team, default look, voice and captions, file naming, where finished files go, and anything you always or never do. Claude follows it on every ad and adds to it when you tell it something new.
 - **It remembers each brand.** Product, buyer, look and feedback are saved per brand, so the next ad only needs the script.
 
-## Built for Kie.ai
+## Built for Kie.ai, also works with Replicate and Higgsfield
 
 This skill is built for [Kie.ai](https://kie.ai) and tested on it. One Kie key and one balance cover the images, video clips, lip-sync and talking avatars. If you want generated voiceovers, add an [ElevenLabs](https://elevenlabs.io) key too.
+
+**Two more ready-made options**, picked at setup. You can mix them: each job (images, video, voice, music, lip-sync) can use a different one.
+
+| | What it covers | Key |
+|---|---|---|
+| [Kie.ai](https://kie.ai) (default) | Images, video, voiceover, music, lip-sync, talking avatars | `KIE_API_KEY` |
+| [Replicate](https://replicate.com) | Images, video, voiceover, music, lip-sync, talking avatars. Pay per result, many models to choose from | `REPLICATE_API_TOKEN` |
+| [Higgsfield](https://higgsfield.ai) API | Images and video | `HF_KEY` (key ID and secret as `id:secret`) |
+| Higgsfield MCP | Images, video, voiceover and lip-sync, from inside Claude (paid in Higgsfield credits) | Connect the Higgsfield connector in Claude |
 
 **Prefer something else?** You can still use another API or any connected MCP that makes images, video or audio instead. Claude checks what you have at setup. With no tools at all, Claude writes each prompt for you to run by hand in any app, and carries on when you send the result back.
 
@@ -60,6 +69,8 @@ pip3 install -r ~/.claude/skills/ai-ad-editor/requirements.txt
 ```bash
 export KIE_API_KEY="..."
 export ELEVENLABS_API_KEY="..."   # optional, for generated voiceovers
+export REPLICATE_API_TOKEN="..."  # optional, to use Replicate
+export HF_KEY="<key id>:<secret>" # optional, to use the Higgsfield API
 ```
 
 On Windows (PowerShell), then open a new terminal:
@@ -67,6 +78,8 @@ On Windows (PowerShell), then open a new terminal:
 ```powershell
 setx KIE_API_KEY "..."
 setx ELEVENLABS_API_KEY "..."   # optional
+setx REPLICATE_API_TOKEN "..."  # optional
+setx HF_KEY "<key id>:<secret>" # optional
 ```
 
 On Windows the skill folder is `%USERPROFILE%\.claude\skills\ai-ad-editor`, and the commands are `python` instead of `python3` and `pip` instead of `pip3`.
@@ -90,6 +103,17 @@ You pay your AI tools directly. The skill itself is free. Rough prices on Kie.ai
 | Lip-sync a talking shot | $0.16 |
 | A 30-second ad (about 10 clips) | about $4 |
 | A 60-second ad with 3 hooks | about $8 to $10 |
+
+On Replicate and Higgsfield, video is billed per second, so asking for each shot's own length (`--fit`) costs less than the full 8 seconds:
+
+| Item | Replicate | Higgsfield API |
+|---|---|---|
+| Image | $0.03 to $0.15 (Nano Banana 2.1 / Pro) | $0.04 to $0.08 (best tier: no published price) |
+| 8-second clip, standard quality, no sound | $0.80 (Veo 3.1 Fast) | $0.64 (Wan 3.0, 1080p) |
+| The same clip at 4 seconds (`--fit`) | $0.40 | $0.32 |
+| Lip-sync a talking shot | $0.16 to $0.33 for a 4-second line | Higgsfield MCP only |
+| Voiceover, 60 seconds | about $0.09 (ElevenLabs v3) | Higgsfield MCP only |
+| A 30-second ad (about 10 clips) | about $9, or about $5 with `--fit` | about $7, or about $4 with `--fit` |
 
 Claude shows the estimate before every paid run, and you can set a per-run spending limit.
 
@@ -125,7 +149,7 @@ The first time it times a voiceover, it downloads a small speech model. That tak
 
 ## Add another AI service
 
-Copy `scripts/providers/kie.py`, set `name`, `env_key` and `slots`, write the methods for the jobs it does (`image`, `video`, `voice`, `lipsync`, `avatar`), and add it to `ALL` in `scripts/providers/__init__.py`. Run `python3 scripts/check_setup.py` and it shows up. Pull requests for new services are welcome.
+Copy `scripts/providers/kie.py` (or `replicate.py` / `higgsfield.py`), set `name`, `env_key` and `slots`, write the methods for the jobs it does (`image`, `video`, `voice`, `lipsync`, `avatar`), and add it to `ALL` in `scripts/providers/__init__.py`. Run `python3 scripts/check_setup.py` and it shows up. Pull requests for new services are welcome.
 
 ## FAQ
 
