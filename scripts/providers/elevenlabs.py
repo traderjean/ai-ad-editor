@@ -1,7 +1,7 @@
 """ElevenLabs: voiceovers. Default model eleven_v3 (most natural, supports [audio tags])."""
 import urllib.parse
 
-from ._base import Provider, ProviderError, Result, http, with_retries
+from ._base import Provider, ProviderError, Result, http, submit
 
 API = "https://api.elevenlabs.io"
 
@@ -24,12 +24,12 @@ class ElevenLabs(Provider):
             used, limit = d.get("character_count", 0), d.get("character_limit", 0)
             return f"key OK, {d.get('tier', '?')} plan, {limit - used:,} characters left this month"
         except ProviderError as e:
-            if e.code != 401:
+            if e.code != 401 or "permission" not in str(e).lower():     # a bad or revoked key is a 401 too
                 raise
         try:
             return f"key OK, {len(self.voices())} voices available (restricted key: no plan info)"
         except ProviderError as e:
-            if e.code != 401:
+            if e.code != 401 or "permission" not in str(e).lower():
                 raise
         return "key set, but restricted: can't list voices for free. Text to speech may still work; pass --voice <id>"
 
@@ -52,7 +52,8 @@ class ElevenLabs(Provider):
         if language and "v2_5" in body["model_id"]:      # only the v2.5 models take a forced language; v3 detects it
             body["language_code"] = language
         url = f"{API}/v1/text-to-speech/{urllib.parse.quote(voice_id)}?output_format=mp3_44100_128"
-        audio = with_retries(lambda: http("POST", url, headers=self._h(), body=body, timeout=600, want="bytes"))
+        # Paid: resent only when ElevenLabs turned it away (429). After a cut-off or a 5xx the audio may be made.
+        audio = submit(lambda: http("POST", url, headers=self._h(), body=body, timeout=600, want="bytes"))
         if not audio:
             raise ProviderError("ElevenLabs returned no audio")
         with open(out, "wb") as f:

@@ -9,6 +9,7 @@ import os
 import time
 import urllib.error
 import urllib.request
+from http.client import HTTPException     # not `import http.client`: the http() below would shadow it
 
 
 class ProviderError(Exception):
@@ -112,7 +113,7 @@ def http(method, url, headers=None, body=None, raw=None, timeout=120, want="json
                             rejected=e.code == 429)
     except urllib.error.URLError as e:
         raise ProviderError(f"Network error: {e.reason}", retry=True)
-    except (ConnectionError, TimeoutError, OSError) as e:      # e.g. "connection reset by peer"
+    except (ConnectionError, TimeoutError, OSError, HTTPException) as e:   # e.g. "connection reset by peer", a cut-off reply
         raise ProviderError(f"Network error: {e}", retry=True)
     if want != "json":
         return data
@@ -163,7 +164,7 @@ def download(url, out, tries=4):
             with open(out, "wb") as f:
                 f.write(data)
             return out
-        except (urllib.error.URLError, ConnectionError, TimeoutError, OSError) as e:
+        except (urllib.error.URLError, ConnectionError, TimeoutError, OSError, HTTPException) as e:
             gone = isinstance(e, urllib.error.HTTPError) and e.code in (401, 403, 404, 410)   # retrying won't help
             if gone or attempt == tries - 1:
                 raise ProviderError(f"Made, but the download failed ({e}). The file may still be at: {url} "
