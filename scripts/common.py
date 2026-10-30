@@ -79,6 +79,17 @@ def duration(path):
     return int(h) * 3600 + int(mi) * 60 + float(se)
 
 
+def load_audio(path, rate=16000):
+    """Mono float32 samples for faster-whisper, decoded with our own ffmpeg. Passing a file path makes
+    faster-whisper decode with PyAV, whose newer releases break it ("unexpected keyword 'metadata_errors'")."""
+    import numpy as np
+    r = subprocess.run([ffmpeg(), "-nostdin", "-hide_banner", "-loglevel", "error", "-i", path,
+                        "-f", "s16le", "-ac", "1", "-ar", str(rate), "-"], capture_output=True)
+    if r.returncode != 0:
+        sys.exit(f"Could not read the audio in {path}:\n" + r.stderr.decode(errors="replace")[-1000:])
+    return np.frombuffer(r.stdout, np.int16).astype(np.float32) / 32768
+
+
 def mmss(seconds):
     return f"{int(seconds // 60)}:{int(round(seconds % 60)):02d}"
 
