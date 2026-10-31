@@ -22,9 +22,11 @@ JOB = ".job.json"           # <out>.job.json = the paid job that will write `out
 
 
 class ProviderError(Exception):
-    def __init__(self, msg, code=None, retry=False, rejected=False):
+    def __init__(self, msg, code=None, retry=False, rejected=False, made=False, cost=None):
         super().__init__(msg)
         self.code = code
+        self.made = made                    # True = the job finished (and was paid) but its file wasn't saved
+        self.cost = cost                    # with made: the USD it cost (real, else expected), or None
         self.retry = retry or rejected      # True = busy / rate-limited, worth trying again
         self.rejected = rejected            # True = turned away before anything started (safe to resend a paid job)
 
@@ -85,7 +87,7 @@ class Provider:
 
     def pending(self, out):
         """The job an earlier run of this adapter left in <out>.job.json, else None:
-        {"provider", "model", "id", "poll", "started"}."""
+        {"provider", "model", "id", "poll", "started", "usd", "note"}."""
         try:
             with open(out + JOB, encoding="utf-8") as f:
                 job = json.load(f)
@@ -93,13 +95,16 @@ class Provider:
             return None
         return job if isinstance(job, dict) and job.get("provider") == self.name and job.get("id") else None
 
-    def remember(self, out, model, job_id, poll):
+    def remember(self, out, model, job_id, poll, usd=None, note=None):
         """Call right after the provider accepted a paid job for `out`: until the result is saved, a re-run
-        collects this job instead of starting (and paying for) another."""
+        collects this job instead of starting (and paying for) another. usd = what this job is expected to
+        cost, note = what it is (e.g. "model, 4s"): a re-run that collects it reports these, not its own."""
         if not out or not job_id:
             return
         job = {"provider": self.name, "model": model, "id": job_id, "poll": poll,
-               "started": datetime.datetime.now().astimezone().isoformat(timespec="seconds")}
+               "started": datetime.datetime.now().astimezone().isoformat(timespec="seconds"), "usd": usd}
+        if note:
+            job["note"] = note
         try:
             os.makedirs(os.path.dirname(os.path.abspath(out)) or ".", exist_ok=True)
             with open(out + JOB + ".tmp", "w", encoding="utf-8") as f:
@@ -127,6 +132,14 @@ class Provider:
     def earlier(job):
         """Added to a Result's note when it came from a job an earlier run started."""
         return f" (finished job {job['id']} started {job.get('started', 'earlier')})" if job else ""
+
+    @staticmethod
+    def bought(job, usd, note):
+        """(cost, note) for a Result: a job an earlier run started keeps what that run asked for and expected
+        to pay (its own settings, not this run's), else this run's estimate and note."""
+        if not job:
+            return usd, note
+        return job.get("usd"), (job.get("note") or job.get("model") or note) + Provider.earlier(job)
 
     # ---- slots (implement the ones listed in `slots`) ----
 
@@ -215,9 +228,10 @@ def submit(fn, tries=5, base_wait=10):
             raise
 
 
-def download(url, out, tries=4):
+def download(url, out, tries=4, cost=None):
     """Save a result. Retried, because by now the job is already paid for. If the provider has already deleted
-    the file, the job for `out` can't be collected by a re-run either, so its <out>.job.json goes too."""
+    the file, the job for `out` can't be collected by a re-run either, so its <out>.job.json goes too.
+    Errors carry made=True and cost (what the job cost, or None), so the spend can still be logged."""
     os.makedirs(os.path.dirname(os.path.abspath(out)) or ".", exist_ok=True)
     for attempt in range(tries):
         try:
@@ -235,9 +249,9 @@ def download(url, out, tries=4):
                     pass
                 raise ProviderError(f"Made, but the download failed ({e}): the provider no longer has the file at "
                                     f"{url}, so it can't be collected. Running it again makes a new one (paid).",
-                                    code=e.code)
+                                    code=e.code, made=True, cost=cost)
             if attempt == tries - 1:
                 raise ProviderError(f"Made, but the download failed ({e}). The file may still be at: {url} "
                                     f"(providers delete results after a while, so save it soon). Running the same "
-                                    f"command again downloads it without paying again.")
+                                    f"command again downloads it without paying again.", made=True, cost=cost)
             time.sleep(5 * (attempt + 1))

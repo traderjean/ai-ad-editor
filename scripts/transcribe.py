@@ -8,7 +8,8 @@ Writes <project>/words.json and <project>/shots_draft.json (an existing words fi
 spelling where the two line up one for one; anything it can't line up is printed so you can fix it
 by hand. What Whisper heard is kept as "heard" on those words, for verify_vo.py.
 --trust-script (for a voiceover generated from the script): what can't be lined up takes the script's
-words too, spread over the time Whisper heard something there, so nothing is left to fix by hand.
+words too, spread over the time Whisper heard something there, so nothing is left to fix by hand. Script
+words after the last word heard (a take cut off, or a line it doesn't say) are printed, never timed.
 If less than half of the script is heard (the wrong language, voiceover or script), nothing is written.
 Shots break at sentence ends or pauses and are never longer than --max-shot seconds
 (default: the video slot's max_seconds in providers.json).
@@ -43,6 +44,26 @@ if a.trust_script and not a.script:
     ap.error("--trust-script needs --script (the script the voiceover was generated from)")
 max_shot = a.max_shot or float(load_settings()["video"].get("max_seconds", 8))
 
+
+def read_script(path):
+    """The script's text: UTF-8 (with or without Notepad's byte-order mark) or UTF-16, else Windows-1252."""
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+    except OSError as e:
+        sys.exit(f"Can't read the script {path} ({e.strerror}): check the path and run this again.")
+    if raw[:2] in (b"\xff\xfe", b"\xfe\xff"):        # Notepad's "Unicode"
+        return raw.decode("utf-16", errors="replace")
+    try:
+        return raw.decode("utf-8-sig")
+    except UnicodeDecodeError:          # an older Windows "ANSI" save of a French or German script
+        print(f"NOTE {path} isn't UTF-8 (read as Windows-1252): check the accents in {a.words_out}, or save the "
+              "script as UTF-8 and run this again.")
+        return raw.decode("cp1252", errors="replace")
+
+
+script_text = read_script(a.script) if a.script else ""     # before Whisper: a wrong path fails fast
+
 from faster_whisper import WhisperModel
 
 os.makedirs(a.project, exist_ok=True)
@@ -69,8 +90,7 @@ def spread(texts, t0, t1, heard):
 
 # ---- fix misheard words against the script ----
 if a.script:
-    with open(a.script, encoding="utf-8-sig") as f:
-        toks = re.sub(r"\[[^\]]*\]", " ", f.read()).split()   # drop [audio tags]
+    toks = re.sub(r"\[[^\]]*\]", " ", script_text).split()   # drop [audio tags]
     # French typography puts a space before ? ! : ; and inside « »: keep each mark on its word, so sentence ends
     # still end draft shots and caption chunks ("encore ?" -> "encore?").
     script_words = []
@@ -96,7 +116,7 @@ if a.script:
                  f"{lang}? Pass --language <code> for another language (e.g. --language fr), check that this is the "
                  f"right voiceover and script ({a.script}), or run without --script to time the words as heard. "
                  "Nothing was written.")
-    fixed, unsure, tail = 0, [], []
+    fixed, unsure = 0, []
     for op, i1, i2, j1, j2 in ops:
         if op == "equal":       # same word: still take the script's spelling (brand capitals, punctuation)
             for k in range(i2 - i1):
@@ -136,16 +156,20 @@ if a.script:
             else:                       # insert: nothing heard for these words
                 n = j2 - j1
                 t0 = words[i1 - 1]["e"] if i1 else 0.0
-                t1 = words[i1]["s"] if i1 < len(words) else t0 + 0.3 * n
+                if i1 == len(words) or not i1 and words[0]["s"] < 0.08 * n:
+                    # Nothing heard after the last word (or before the first, with no time for them): the take
+                    # doesn't say them. Inventing a time would caption words nobody says.
+                    unsure.append(f'{t0:.1f}s  heard nothing ' + ("after the last word" if i1 else "before the first word")
+                                  + f'  script says "{want}": the voiceover '
+                                  + ("ends before the script does" if i1 else "doesn't start with it"))
+                    continue
+                t1 = words[i1]["s"]
                 if t1 - t0 < 0.08 * n and i1:     # no room: take it from the end of the word before
                     prev = words[i1 - 1]
                     t0 = max(round((prev["s"] + prev["e"]) / 2, 2), round(t1 - 0.08 * n, 2))
                     prev["e"] = t0
                 new = spread(script_words[j1:j2], t0, max(t1, t0), "")
-                if i1 < len(words):
-                    words[i1]["_before"] = words[i1].get("_before", []) + new
-                else:
-                    tail += new
+                words[i1]["_before"] = words[i1].get("_before", []) + new
             fixed += j2 - j1
             print(f'  took the script\'s words at {new[0]["s"]:.1f}s: "{want}" '
                   + (f'(heard "{heard}")' if heard else "(heard nothing there)"))
@@ -164,12 +188,16 @@ if a.script:
             rebuilt += w["_replace"]
         else:
             rebuilt.append(w)
-    words = rebuilt + tail
+    words = rebuilt
     print(f"Fixed {fixed} word(s) to match the script.")
     for u in unsure:
         print("  CHECK BY HAND:", u)
     left = [w for w in words if w.get("heard") == w["w"]]
-    if left or unsure:
+    if unsure and a.trust_script:
+        print(f"The voiceover doesn't say all of the script, so {a.words_out} has only what it says and the captions "
+              f"leave those words out. Listen to {a.vo} there: if it was cut off or skips a line, make the voiceover "
+              "again (and time the new one); if the script has words it was never meant to say, it's fine as it is.")
+    elif left or unsure:
         print(f"{len(left)} word(s) are still as Whisper heard them, not as the script says, and the captions show "
               f"them that way. Fix each CHECK BY HAND line in {a.words_out}: change \"w\" and keep \"heard\", add a "
               "missing word with \"heard\": \"\", delete a word the voiceover doesn't say, and delete \"heard\" from a "

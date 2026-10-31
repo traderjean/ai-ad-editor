@@ -2,8 +2,8 @@
 
     verify_vo.py <project> [final/ad1.mp4 ...] [--shots shots.json] [--language fr]
 
-With no files, the newest version of every final in <project>/final/ is checked (previews and older
-_v<n> takes skipped). Files can be given
+With no files, the newest version of every 9:16 final in <project>/final/ is checked (previews, older
+_v<n> takes and the 4x5 / 1x1 / 16x9 sizes, which carry their 9:16's sound, skipped). Files can be given
 from the project folder (final/ad1.mp4) or from the working folder (<project>/final/ad1.mp4).
 Each file is checked against the plan it was cut from: <project>_hookB_... -> shots_hookB.json,
 anything else -> shots.json (--shots forces one plan for every file).
@@ -15,7 +15,10 @@ Three checks per file with a voiceover:
      doesn't count as missing). When the waveform check passes, a word the final is heard saying
      differently is checked against the voiceover itself: the words file must be the voiceover's.
   3. Captions in sync: each word is heard in the final when the words file says (the captions are cut
-     from it), so a words file left over from another voiceover take fails.
+     from it), so a words file left over from another voiceover take fails, and so does one from a shorter
+     take (words heard in the voiceover after its last word; sound with no words in it, a music bed or room
+     tone, is only noted). A word with nothing heard for it ("heard": "") needs the voiceover to make a
+     sound under it, or the captions show a word nobody says.
 Prints PASS or FAIL for each file; exits 1 if any file fails.
 For ads with no voiceover file where the video tool's own voices speak ("use_clip_audio"), each talking
 shot's line (its "text", the approved script) must be heard inside that shot: a line cut off by its slot,
@@ -30,6 +33,7 @@ import glob
 import json
 import os
 import re
+import shlex
 import sys
 import unicodedata
 
@@ -57,7 +61,9 @@ for f in a.finals or [os.path.join("final", "*.mp4")]:
     if os.path.exists(cand) or os.path.exists(f):     # from the project folder, else from the working folder
         finals.append(cand if os.path.exists(cand) else f)
         continue
-    found = sorted(p for p in glob.glob(cand) or glob.glob(f) if not os.path.basename(p).startswith("preview_"))
+    # only the file part is a pattern: a folder named "Ad [v2]" is a name, not a set of letters
+    found = sorted(p for p in glob.glob(os.path.join(glob.escape(a.project), f)) or glob.glob(f)
+                   if not os.path.basename(p).startswith("preview_"))
     if not found:
         sys.exit(f"No file matches {f} (give it from the project folder or from the working folder).")
     finals += found
@@ -69,6 +75,13 @@ if not a.finals:              # by default only the newest take of each final: o
         if key not in newest or n > newest[key][0]:
             newest[key] = (n, p)
     finals = sorted(p for _, p in newest.values())
+    # The 4x5 / 1x1 / 16x9 files carry their 9:16's sound untouched (variants.py copies it), so hearing them again
+    # proves nothing, and a size not made again yet from a new cut would fail for the wrong reason.
+    sizes = [p for p in finals if re.search(r"_(4x5|1x1|16x9)_", os.path.basename(p))]
+    if sizes and len(sizes) < len(finals):
+        finals = [p for p in finals if p not in sizes]
+        print(f"({len(sizes)} 4x5/1x1/16x9 file(s) not checked: they have their 9:16's sound, and qc.py checks each "
+              "was made from the newest 9:16)")
 
 
 def norm(t):
@@ -157,10 +170,11 @@ def load_plan(rel, data):
     target = own if own_vo else words_rel
     m = re.match(r"words_(.+)\.json$", os.path.basename(target))          # words_hookB.json <- script_hookB.txt
     script = os.path.join(a.project, "inputs", f"script_{m.group(1)}.txt" if m else "script.txt")
-    redo = (f"python3 $S/transcribe.py {os.path.normpath(vp)} {a.project} --script "
-            + (os.path.normpath(script) if os.path.exists(script) else "<its script>")
+    q = shlex.quote             # a space or a bracket in a folder name still pastes as one argument
+    redo = (f"python3 $S/transcribe.py {q(os.path.normpath(vp))} {q(a.project)} --script "
+            + (q(os.path.normpath(script)) if os.path.exists(script) else "<its script>")
             + (f" --language {lang}" if lang != "en" else "")
-            + (f" --words-out {target} --no-draft" if target != "words.json" else ""))
+            + (f" --words-out {q(target)} --no-draft" if target != "words.json" else ""))
     if not a.words and data.get("words") != target and target != "words.json":
         redo += f', and set "words": "{target}" in {rel}'
     if not os.path.exists(wp):
@@ -178,7 +192,25 @@ def load_plan(rel, data):
     tok = [(norm(x), i) for i, w in enumerate(ref) for x in str(w.get("heard", w["w"])).split() if norm(x)]
     if not tok:
         return f"{wp} has no words in it, so the ad has no captions: time the voiceover again ({redo})."
-    return {"vo": vo, "vp": vp, "words": words_rel, "redo": redo, "ref": ref, "tok": tok, "lang": lang}
+    # A word added with nothing heard for it ("heard": "") isn't looked for in the final, so at least the voiceover
+    # must make a sound there: one placed past the voice's end (or in a pause) is a caption nobody says.
+    mute, k = [], 0
+    while k < len(ref):
+        if ref[k].get("heard") != "" or not norm(str(ref[k]["w"])):
+            k += 1
+            continue
+        j = k
+        while j + 1 < len(ref) and ref[j + 1].get("heard") == "":
+            j += 1
+        first = k - 1 if k and ref[k - 1].get("heard") else k   # a word spread over what was heard just before
+        s0, s1 = float(ref[first]["s"]), float(ref[j].get("e", ref[j]["s"]))
+        steps = np.arange(s0, max(s1, s0 + 0.05), 0.01)
+        loud = sum(np.abs(vo[int(t * 8000):int(t * 8000) + 80]).max(initial=0) >= 300 / 32768 for t in steps)
+        if loud < len(steps) / 2:      # a word is mostly sound; the tail of the word before is short
+            mute.append((k, j))
+        k = j + 1
+    return {"vo": vo, "vp": vp, "vo_rel": vo_rel, "words": words_rel, "redo": redo, "ref": ref, "tok": tok,
+            "lang": lang, "mute": mute}
 
 
 def hear(path, lang):
@@ -396,8 +428,17 @@ for path in finals:
     vo = plan["vo"]
     tail = [t for t in np.arange(last + 0.5, len(vo) / 8000 - 0.5, 0.5)
             if np.abs(vo[int(t * 8000):int(t * 8000) + 4000]).max() >= 300 / 32768]
-    longer = len(tail) >= 3
-    ok = not werr and not sync and not stale and not longer
+    after = []
+    longer = noise = len(tail) >= 3
+    if noise:
+        # Sound is talking only when words are heard in it: a music bed or room tone in the voiceover file isn't,
+        # and timing the voiceover again can't change that.
+        if "heard" not in plan:
+            plan["heard"] = hear(plan["vp"], plan["lang"])
+        after = [g for g in plan["heard"] if g[1] > last + 0.1]       # the next word after the last one
+        longer = len(after) >= 2
+    mute = plan["mute"]
+    ok = not werr and not sync and not stale and not longer and not mute
     bad += not ok
     wave = "identical to the voiceover" if not werr else "MISMATCH"
     print(f"{'PASS' if ok else 'FAIL'}  {name}: {matched}/{len(tok)} words in place, waveform {wave}{tag}")
@@ -417,11 +458,30 @@ for path in finals:
     if len(stale) > 6:
         print(f"      ... and {len(stale) - 6} more places")
     if longer:
-        print(f"      the voiceover goes on talking after {plan['words']} ends at {last:.1f}s (sound at "
-              f"{tail[0]:.1f}s and later): it was timed from a shorter take, so the end has no captions")
+        print(f"      the voiceover goes on talking after {plan['words']} ends at {last:.1f}s (heard \""
+              + " ".join(g[2] for g in after[:8]) + ("..." if len(after) > 8 else "") + f"\" from {after[0][1]:.1f}s): "
+              "it was timed from a shorter take, so the end has no captions")
     if sync or stale or longer:
         print(f"      The captions come from {plan['words']}: time this voiceover again ({plan['redo']}), "
               "then run edit.py again.")
+    for k, j in mute:
+        print(f"      {plan['words']} has \"{' '.join(str(w['w']) for w in ref[k:j + 1])}\" at {ref[k]['s']:.1f}s with "
+              "nothing heard for it, and the voiceover is silent there: the captions show words nobody says. Listen "
+              f"to {plan['vo_rel']} there: if it doesn't say them, delete them from {plan['words']}; if it does, set "
+              "their \"s\" and \"e\" to when it says them. Then run edit.py again.")
+    if noise and not longer and after and not plan.get("told_bed"):
+        plan["told_bed"] = True     # once per plan
+        print(f"      note: only \"{after[0][2]}\" is heard in {plan['vo_rel']} after the last word of {plan['words']} "
+              f"({after[0][1]:.1f}s, the rest is music or room tone): if the voiceover really says it there, time it "
+              f"again ({plan['redo']}) and run edit.py again; if not, it's fine.")
+    elif noise and not longer and not plan.get("told_bed"):
+        plan["told_bed"] = True     # once per plan
+        root, ext = os.path.splitext(plan["vo_rel"])
+        print(f"      note: {plan['vo_rel']} has {len(vo) / 8000 - last:.1f}s of sound after its last word "
+              f"({last:.1f}s) with no words in it (a music bed or room tone), and the ad plays it: fine if it's meant to "
+              f"be there. To end sooner, trim it (ffmpeg -i {shlex.quote(os.path.normpath(plan['vp']))} -t "
+              f"{last + 0.5:.1f} {shlex.quote(os.path.normpath(os.path.join(a.project, root + '_trimmed' + ext)))}), "
+              f"set \"vo\": \"{root}_trimmed{ext}\" in {rel} and run edit.py again.")
     for i1, i2, _, _ in ([] if stale else missing):
         if i2 - i1 > 2:
             i, j = tok[i1][1], tok[i2 - 1][1] + 1

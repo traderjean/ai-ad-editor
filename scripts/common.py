@@ -46,6 +46,22 @@ def load_json(path, fix=""):
         sys.exit(f"{path} is not valid JSON{where}. {fix}".strip())
 
 
+def read_text(path):
+    """A text file the user may have saved anywhere (a script, a prompt): UTF-8 with or without Notepad's
+    byte-order mark, UTF-16 (Notepad's "Unicode"), else Windows-1252 (an older "ANSI" save of a French or
+    German script) with a note to check its accents."""
+    with open(path, "rb") as f:
+        raw = f.read()
+    if raw[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        return raw.decode("utf-16", errors="replace")
+    try:
+        return raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        print(f"NOTE {path} isn't UTF-8 (read as Windows-1252): check its accents, or save it as UTF-8 and run "
+              f"this again.")
+        return raw.decode("cp1252", errors="replace")
+
+
 def load_settings():
     s = json.loads(json.dumps(DEFAULT_SETTINGS))
     if os.path.exists(SETTINGS):
@@ -102,7 +118,10 @@ def run_ffmpeg(args):
 
 def duration(path):
     """Length of an audio or video file in seconds (no ffprobe needed)."""
-    r = subprocess.run([ffmpeg(), "-hide_banner", "-i", path], capture_output=True, text=True,
+    exe = ffmpeg()
+    if not exe:
+        sys.exit("ffmpeg not found. Install it (see check_setup.py) and try again.")
+    r = subprocess.run([exe, "-hide_banner", "-i", path], capture_output=True, text=True,
                        encoding="utf-8", errors="replace")
     m = re.search(r"Duration: (\d+):(\d+):([\d.]+)", r.stderr)
     if not m:
@@ -164,6 +183,14 @@ def find_project(path=None):
     return cwd
 
 
+def rel(path, start):
+    """`path` as seen from `start` for messages; the full path when it's on another drive (Windows)."""
+    try:
+        return os.path.relpath(path, start)
+    except ValueError:
+        return path
+
+
 def voiceover_file(project, data):
     """The voiceover a plan is cut to: its "vo", else the first avatar shot's video (an AI avatar video is the
     voiceover as well as the picture). None when there is neither."""
@@ -175,13 +202,16 @@ def voiceover_file(project, data):
 
 def clip_path(project, shot):
     """The video file a shot plays: its "clip" override (e.g. a lip-synced take), else clips/<id>.mp4,
-    else its "source" for an AI talking-avatar video. None for stills and text cards."""
+    else its "source" for an AI talking-avatar video. None for stills and text cards, and for a library or
+    avatar shot with no "source" yet."""
     kind = shot.get("type", "clip")
     if shot.get("clip"):
         return os.path.join(project, shot["clip"])
     if kind in CLIP_TYPES:
         return os.path.join(project, "clips", shot["id"] + ".mp4")
     if kind in ("avatar", "footage", "library"):   # "footage" = old name; "library" = a clip from the user's library
+        if not shot.get("source"):
+            return None
         path = os.path.join(project, shot["source"])
         if kind == "library" and not os.path.exists(path) and os.path.exists(shot["source"]):
             return shot["source"]       # "<folder>/<clip>", the folder as given to library.py (from the working folder)

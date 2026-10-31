@@ -108,13 +108,14 @@ class Higgsfield(Provider):
         with_retries(lambda: http("PUT", d["upload_url"], headers=put, raw=data, timeout=300, want="bytes"))
         return d["public_url"]
 
-    def _run(self, model, inp, timeout=900, out=None):
+    def _run(self, model, inp, timeout=900, out=None, usd=None, note=None):
         """Submit + poll. Returns the finished request JSON.
 
         Every submit carries an Idempotency-Key, so resending after a network error or a busy reply returns the
         same request instead of making (and charging) a second one. With `out`, the request is kept in
         <out>.job.json until the caller has saved the result, and a request an earlier run left there is
-        collected instead of submitting one (then `inp` is not used)."""
+        collected instead of submitting one (then `inp` is not used). usd/note = what this request is expected
+        to cost and what it is, kept in the job file for a re-run's spend line."""
         job = self.pending(out)
         if job:                                   # an earlier run's request: poll that one, submit nothing
             rid = job["id"]
@@ -127,7 +128,7 @@ class Higgsfield(Provider):
             if not status_url:
                 raise ProviderError(f"Higgsfield took the job but sent back no request id ({str(sub)[:200]}). It may "
                                     f"still finish (and be charged): check console.higgsfield.ai before running it again.")
-            self.remember(out, model, rid or status_url, status_url)
+            self.remember(out, model, rid or status_url, status_url, usd=usd, note=note)
         earlier = " (started by an earlier run)" if job else ""
         t0, every = time.time(), 2.0
         while True:
@@ -204,14 +205,16 @@ class Higgsfield(Provider):
             inp.update(resolution=res, quality="low" if quality == "draft" else "medium", image_urls=urls)
         elif urls:
             inp["image_urls"] = urls
-        d = self._run(m, inp, timeout=600, out=out)
+        usd, note = self.bought(job, self.estimate("image", quality, model=model), m)
+        d = self._run(m, inp, timeout=600, out=out, usd=usd, note=note)
         imgs = d.get("images") or []
         if not imgs or not imgs[0].get("url"):
             self.forget(out)
-            raise ProviderError("Higgsfield finished but returned no image. Running it again makes a new one.")
-        download(imgs[0]["url"], out)
+            raise ProviderError("Higgsfield finished but returned no image. Running it again makes a new one (paid).",
+                                made=True, cost=usd)
+        download(imgs[0]["url"], out, cost=usd)
         self.forget(out)
-        return Result([out], self.estimate("image", quality, model=model), (job or {}).get("model", m) + self.earlier(job))
+        return Result([out], usd, note)
 
     def video(self, prompt, out, frame=None, seconds=8, aspect="9:16", quality="standard", audio=False, model=None):
         m = self.model_for("video", quality, model)
@@ -236,12 +239,13 @@ class Higgsfield(Provider):
                 inp["aspect_ratio"] = aspect
             if fam == "alibaba/wan-3.0":
                 inp["enable_thinking"] = False
-        d = self._run(m, inp, timeout=1800, out=out)
+        usd, note = self.bought(job, self.estimate("video", quality, seconds=length, model=model), f"{m}, {length}s")
+        d = self._run(m, inp, timeout=1800, out=out, usd=usd, note=note)
         url = (d.get("video") or {}).get("url")
         if not url:
             self.forget(out)
-            raise ProviderError("Higgsfield finished but returned no video. Running it again makes a new one.")
-        download(url, out)
+            raise ProviderError("Higgsfield finished but returned no video. Running it again makes a new one (paid).",
+                                made=True, cost=usd)
+        download(url, out, cost=usd)
         self.forget(out)
-        est = self.estimate("video", quality, seconds=length, model=model)
-        return Result([out], est, f"{m}, {length}s" + self.earlier(job))
+        return Result([out], usd, note)

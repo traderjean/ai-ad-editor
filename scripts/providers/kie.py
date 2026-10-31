@@ -95,26 +95,28 @@ class Kie(Provider):
         data = d.get("data") or {}
         return data.get("downloadUrl") or data.get("fileUrl")
 
-    def _run(self, model, inp, timeout=900, every=8, out=None, name=None):
+    def _run(self, model, inp, timeout=900, every=8, out=None, name=None, usd=None):
         """createTask + poll, made again only when the task failed because Kie was busy (failed tasks aren't
-        charged). Returns (result_urls, usd or None). With `out`, the task id is kept in <out>.job.json until
-        the caller has saved the result, and a task an earlier run left there is collected instead of making
-        a new one (then `inp` is not used). name = the model id to write down, when `model` is an endpoint."""
+        charged). Returns (result_urls, usd or None): Kie's creditsConsumed, else the expected cost (`usd` for
+        a new task, the one written down for an earlier run's task). With `out`, the task id is kept in
+        <out>.job.json until the caller has saved the result, and a task an earlier run left there is collected
+        instead of making a new one (then `inp` is not used). name = the model id to write down, when `model`
+        is an endpoint."""
         job = self.pending(out)
         if job:
-            return self._poll(job["id"], timeout, every, out, resumed=True)
-        return with_retries(lambda: self._run_once(model, inp, timeout, every, out, name), tries=4, base_wait=30)
+            return self._poll(job["id"], timeout, every, out, resumed=True, est=job.get("usd"))
+        return with_retries(lambda: self._run_once(model, inp, timeout, every, out, name, usd), tries=4, base_wait=30)
 
-    def _run_once(self, model, inp, timeout, every, out=None, name=None):
+    def _run_once(self, model, inp, timeout, every, out=None, name=None, usd=None):
         task = (self._req("POST", f"{API}/jobs/createTask", {"model": model, "input": inp}, paid=True).get("data")
                 or {}).get("taskId")
         if not task:
             raise ProviderError("Kie took the job but sent back no task id. It may still finish (and be charged): "
                                 "check the logs at kie.ai before running it again, so it isn't paid for twice.")
-        self.remember(out, name or model, task, f"{API}/jobs/recordInfo?taskId={task}")
-        return self._poll(task, timeout, every, out)
+        self.remember(out, name or model, task, f"{API}/jobs/recordInfo?taskId={task}", usd=usd)
+        return self._poll(task, timeout, every, out, est=usd)
 
-    def _poll(self, task, timeout, every, out=None, resumed=False):
+    def _poll(self, task, timeout, every, out=None, resumed=False, est=None):
         earlier = " (started by an earlier run)" if resumed else ""
         t0 = time.time()
         while True:
@@ -138,12 +140,13 @@ class Kie(Provider):
                 data = res.get("data")
                 urls = (res.get("resultUrls") or (data.get("result_urls") if isinstance(data, dict) else None)
                         or [x.get("audio_url") for x in (data if isinstance(data, list) else []) if x.get("audio_url")])
+                credits = float(d.get("creditsConsumed") or 0)
+                usd = credits * USD_PER_CREDIT if credits else est
                 if not urls:
                     self.forget(out)
                     raise ProviderError(f"Kie task {task}{earlier} finished but returned no file. Running it again "
-                                        f"makes a new one.")
-                credits = float(d.get("creditsConsumed") or 0)
-                return urls, (credits * USD_PER_CREDIT if credits else None)
+                                        f"makes a new one (paid).", made=True, cost=usd)
+                return urls, usd
             if state == "fail":
                 # Kie doesn't charge failed tasks. Most failures here are safety filters.
                 self.forget(out)
@@ -198,11 +201,10 @@ class Kie(Provider):
             inp["image_input"] = urls
             inp["aspect_ratio"] = aspect
             inp["resolution"] = "2K"
-        res, usd = self._run(m, inp, timeout=600, every=4, out=out)
-        download(res[0], out)
+        res, usd = self._run(m, inp, timeout=600, every=4, out=out, usd=IMAGE_EST.get(est))
+        download(res[0], out, cost=usd)
         self.forget(out)
-        return Result([out], usd if usd is not None else IMAGE_EST.get(est), (job or {}).get("model", m)
-                      + self.earlier(job))
+        return Result([out], usd, (job or {}).get("model", m) + self.earlier(job))
 
     def video(self, prompt, out, frame=None, seconds=8, aspect="9:16", quality="standard", audio=False, model=None):
         m = self.model_for("video", quality, model)
@@ -210,9 +212,10 @@ class Kie(Provider):
         if job:                  # an earlier run's clip: collect it, never start a new (or a fallback) one
             res, usd = self._run("veo-3-1", None, out=out)
             model_id = job.get("model") or m
-            download(res[0], out)
+            usd = usd if usd is not None else VIDEO_EST.get(model_id)      # the job's own model, not this run's
+            download(res[0], out, cost=usd)
             self.forget(out)
-            return Result([out], usd if usd is not None else VIDEO_EST.get(model_id), model_id + self.earlier(job))
+            return Result([out], usd, model_id + self.earlier(job))
         inp = {"prompt": prompt + ("" if audio else NO_AUDIO), "model": m, "aspect_ratio": aspect,
                "resolution": "1080p", "duration": 8, "enable_translation": False}
         if frame:
@@ -231,7 +234,8 @@ class Kie(Provider):
         last = None
         for model_id, text in tries:
             try:
-                res, usd = self._run("veo-3-1", dict(inp, model=model_id, prompt=text), out=out, name=model_id)
+                res, usd = self._run("veo-3-1", dict(inp, model=model_id, prompt=text), out=out, name=model_id,
+                                     usd=VIDEO_EST.get(model_id))
                 break
             except ProviderError as e:
                 if "generate audio" not in str(e).lower():
@@ -239,25 +243,25 @@ class Kie(Provider):
                 last = e
         else:
             raise last
-        download(res[0], out)
+        download(res[0], out, cost=usd)
         self.forget(out)
         # Veo on Kie always makes 8s; the edit trims each clip to its shot length.
         note = model_id if model_id == m else f"{model_id} (after {m} refused audio)"
-        return Result([out], usd if usd is not None else VIDEO_EST.get(model_id), note)
+        return Result([out], usd, note)
 
     def music(self, prompt, out, seconds=None, model=None):
         # Suno through Kie. Instrumental so it sits under a voiceover. Suno makes 2 takes; both are saved.
         inp = {"custom_mode": False, "instrumental": True, "model": model or "V6", "prompt": prompt[:500]}
         job = self.pending(out)
-        res, usd = self._run("ai-music-api/generate", inp, timeout=600, out=out)
+        res, usd = self._run("ai-music-api/generate", inp, timeout=600, out=out, usd=MUSIC_EST)
         base, ext = os.path.splitext(out)
         files = []
         for i, url in enumerate(res[:2]):
             path = out if i == 0 else f"{base}_take2{ext or '.mp3'}"
-            download(url, path)
+            download(url, path, cost=usd)
             files.append(path)
         self.forget(out)
-        return Result(files, usd if usd is not None else MUSIC_EST,
+        return Result(files, usd,
                       f"suno {inp['model']}, {len(files)} take(s)" + self.earlier(job))
 
     def voices(self):
@@ -274,11 +278,10 @@ class Kie(Provider):
         inp = {"dialogue": [{"text": text, "voice": voice_id}], "stability": stab}
         m = model or VOICE_MODELS["standard"]
         job = self.pending(out)
-        res, usd = self._run(m, inp, timeout=600, every=4, out=out)
-        download(res[0], out)
+        res, usd = self._run(m, inp, timeout=600, every=4, out=out,
+                             usd=self.estimate("voice", "standard", model=m, chars=len(text)))
+        download(res[0], out, cost=usd)
         self.forget(out)
-        if usd is None:
-            usd = self.estimate("voice", "standard", model=m, chars=len(text))
         return Result([out], usd, "elevenlabs v3 via kie" + self.earlier(job))
 
     def lipsync(self, video, audio, out, quality="standard", model=None):
@@ -289,11 +292,10 @@ class Kie(Provider):
         inp = None if job else {"mode": mode, "video_url": self.upload(video), "audio_url": self.upload(audio)}
         if mode == "lite" and inp:
             inp["align_audio"] = True      # loop the clip if the line is longer than it
-        res, usd = self._run("volcengine/video-to-video-lip-sync", inp, out=out)
-        download(res[0], out)
+        res, usd = self._run("volcengine/video-to-video-lip-sync", inp, out=out,
+                             usd=self.estimate("lipsync", quality, seconds=talk, model=mode))
+        download(res[0], out, cost=usd)
         self.forget(out)
-        if usd is None:
-            usd = self.estimate("lipsync", quality, seconds=talk, model=mode)
         return Result([out], usd, f"volcengine lip sync ({mode})" + self.earlier(job))
 
     def avatar(self, image, audio, out, prompt="", quality="standard", model=None):
@@ -310,9 +312,7 @@ class Kie(Provider):
                    "The person talks naturally to the camera, small head movements, steady handheld phone shot."}
             if m.startswith("infinitalk"):
                 inp["resolution"] = "720p"
-        res, usd = self._run(m, inp, timeout=1800, out=out)
-        download(res[0], out)
+        res, usd = self._run(m, inp, timeout=1800, out=out, usd=self.estimate("avatar", quality, seconds=talk, model=m))
+        download(res[0], out, cost=usd)
         self.forget(out)
-        if usd is None:
-            usd = self.estimate("avatar", quality, seconds=talk, model=m)
         return Result([out], usd, (job or {}).get("model", m) + self.earlier(job))

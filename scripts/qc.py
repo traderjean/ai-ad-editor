@@ -5,7 +5,7 @@
 For the newest take of each file in final/ (previews and older _v<n> takes skipped):
   - size and shape: 1080 wide, the right height for its name (9x16 / 4x5 / 1x1 / 16x9)
   - H.264 video, AAC sound, the sound and the picture both run the full length
-  - no black frames longer than 0.5s (a dark text card is only noted)
+  - no black frames longer than 0.5s (a dark text card or end card is only noted)
   - on 9:16 files, no clip shot whose picture stands still for 1s or more (a clip shorter than its shot, a frozen
     start); stills, text cards and the end card may hold still, and so may a shot with "freeze_ok": true
   - sizes (4x5 / 1x1 / 16x9) made from the newest 9:16, not from an older take of it
@@ -28,7 +28,7 @@ from common import CLIP_TYPES, clip_path, ffmpeg
 PLATFORMS = {   # max ad length (s), max file size (MB)
     "meta": (240 * 60, 4000),
     "tiktok": (10 * 60, 500),
-    "youtube": (60, 4000),          # Shorts
+    "youtube": (180, 4000),         # Shorts: up to 3 min since Oct 2024 (checked Oct 2026)
 }
 SHAPES = {"9x16": (1080, 1920), "4x5": (1080, 1350), "1x1": (1080, 1080), "16x9": (1920, 1080)}
 MOVING = CLIP_TYPES + ("avatar", "library", "footage")      # shot types that should never stand still
@@ -48,7 +48,7 @@ def in_project(f):
 
 
 newest = {}                 # older _v<n> takes stay in final/ for history; check the newest of each
-for f in glob.glob(os.path.join(a.project, "final", "*.mp4")):
+for f in glob.glob(os.path.join(glob.escape(a.project), "final", "*.mp4")):
     if os.path.basename(f).startswith("preview_"):
         continue
     m = re.match(r"(.*)_v(\d+)\.mp4$", os.path.basename(f))
@@ -77,8 +77,30 @@ def shots_for(name):
     path = os.path.join(a.project, rel)
     if not os.path.exists(path):
         return rel, {}
-    with open(path, encoding="utf-8") as f:
-        return rel, json.load(f)
+    try:
+        with open(path, encoding="utf-8-sig") as f:
+            plan = json.load(f)
+    except (OSError, ValueError) as e:
+        if rel not in told:
+            told.add(rel)
+            print(f"NOTE {rel} can't be read ({e}): fix it and run this again (checked without it).")
+        return rel, {}
+    if not isinstance(plan, dict) or not isinstance(plan.get("shots"), list):
+        if rel not in told:
+            told.add(rel)
+            print(f'NOTE {rel} isn\'t a shots file (it should hold {{"shots": [...]}}): checked without it.')
+        return rel, {}
+    return rel, plan
+
+
+told = set()
+
+
+def rel_to_project(path):
+    try:
+        return os.path.relpath(path, a.project)
+    except ValueError:      # Windows: on another drive than the project
+        return path
 
 
 if not a.platform:      # the brief's platform, if the plan has it
@@ -195,7 +217,8 @@ def stills(path, plan, rel, frozen, length):
     for fs, fe in frozen:
         fe = length if fe is None else fe
         if not spans:
-            notes.append(f"picture doesn't move from {fs:.1f}s to {fe:.1f}s ({rel} not found, so a still can't be "
+            why = "has no shots with a start and end" if os.path.exists(os.path.join(a.project, rel)) else "not found"
+            notes.append(f"picture doesn't move from {fs:.1f}s to {fe:.1f}s ({rel} {why}, so a still can't be "
                          "told from a frozen clip; look at it)")
         for s0, s1, s in spans:
             held = min(fe, s1) - max(fs, s0)
@@ -210,7 +233,7 @@ def stills(path, plan, rel, frozen, length):
                              "look at it)")
             elif still_share(path, a0, a1) >= 0.5:
                 if a0 <= s0 + 0.1 and a1 >= s1 - 0.1:
-                    why = f"the whole shot stands still: look at {os.path.relpath(src, a.project)}"
+                    why = f"the whole shot stands still: look at {rel_to_project(src)}"
                 elif a1 >= s1 - 0.1:
                     why = ('its clip runs out before the shot ends. Set a smaller "in", shorten the shot or remake '
                            "the clip")
@@ -260,11 +283,14 @@ for path in files:
     black, frozen, pic, snd = detect(path, shape == "9x16")      # the other sizes are crops of the 9:16
     rel, plan = shots_for(name)
     cards = text_cards(plan, length)
+    ec = plan["endcard"].get("seconds", 3) if isinstance(plan.get("endcard"), dict) else 0
     for s, e in ((float(s), float(e)) for s, e in black):
         if s >= length - 0.5:       # a fade at the very end is fine
             continue
         if any(c0 - 0.2 <= s and e <= c1 + 0.2 for c0, c1 in cards):   # white text on a dark card reads as black
             notes.append(f"dark text card {s:.1f}s to {e:.1f}s (fine if the text shows; check a frame)")
+        elif ec and s >= length - ec - 0.2:      # a logo on black reads as black too
+            notes.append(f"dark end card {s:.1f}s to {e:.1f}s (fine if the logo shows; check a frame)")
         else:
             problems.append(f"black picture {s:.1f}s to {e:.1f}s")
     p, n = stills(path, plan, rel, frozen, length)
