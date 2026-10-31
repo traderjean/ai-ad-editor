@@ -5,6 +5,7 @@ Optional. Copy this file into your working folder as `house-rules.md` and fill i
 ## How hands-on
 - Approvals (every step / key steps only / autopilot):
 - Budget per ad:
+- Clips from (AI / my library: <folder> / mixed):
 
 ## Your team
 - Who approves the shot plan:

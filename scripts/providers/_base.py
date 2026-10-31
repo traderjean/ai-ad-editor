@@ -3,13 +3,22 @@
 Adding a provider = a new file with a class that sets the fields below and implements the slots it supports.
 Every method saves its result to `out` and returns a Result. Costs are real (from the provider) when the
 provider reports them, else an estimate, else None (unknown).
+
+Paid jobs that run on the provider's side (createTask, a prediction, a request) are written down in
+"<out>.job.json" as soon as the provider accepts them, and the file is deleted once the result is saved to
+`out` (or the provider says the job failed or is gone). A run that times out, loses the connection or is
+killed leaves the file behind, and calling the same method for the same `out` again collects that job
+instead of paying for a new one.
 """
+import datetime
 import json
 import os
 import time
 import urllib.error
 import urllib.request
 from http.client import HTTPException     # not `import http.client`: the http() below would shadow it
+
+JOB = ".job.json"           # <out>.job.json = the paid job that will write `out`, until it's collected
 
 
 class ProviderError(Exception):
@@ -66,6 +75,58 @@ class Provider:
     def estimate(self, slot, quality, seconds=None, model=None, audio=False, chars=None):
         """USD per item, or None if unknown. seconds = clip or audio length, chars = voiceover length."""
         return None
+
+    def describe(self, slot, chars=None, model=None):
+        """For a provider that bills in something other than dollars (e.g. plan characters): a free one-line
+        note on what this job will use and what's left, else None."""
+        return None
+
+    # ---- paid jobs an earlier run started and didn't collect ----
+
+    def pending(self, out):
+        """The job an earlier run of this adapter left in <out>.job.json, else None:
+        {"provider", "model", "id", "poll", "started"}."""
+        try:
+            with open(out + JOB, encoding="utf-8") as f:
+                job = json.load(f)
+        except (OSError, ValueError, TypeError):
+            return None
+        return job if isinstance(job, dict) and job.get("provider") == self.name and job.get("id") else None
+
+    def remember(self, out, model, job_id, poll):
+        """Call right after the provider accepted a paid job for `out`: until the result is saved, a re-run
+        collects this job instead of starting (and paying for) another."""
+        if not out or not job_id:
+            return
+        job = {"provider": self.name, "model": model, "id": job_id, "poll": poll,
+               "started": datetime.datetime.now().astimezone().isoformat(timespec="seconds")}
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(out)) or ".", exist_ok=True)
+            with open(out + JOB + ".tmp", "w", encoding="utf-8") as f:
+                json.dump(job, f, indent=1)
+            os.replace(out + JOB + ".tmp", out + JOB)
+        except OSError:
+            pass                # the job runs anyway; only a re-run's free pick-up is lost (errors name the id)
+
+    def forget(self, out):
+        """The result is saved, or the provider no longer has the job: nothing left to collect."""
+        if out:
+            try:
+                os.remove(out + JOB)
+            except OSError:
+                pass
+
+    def again(self, out, where):
+        """What to do about a job that may still finish, for error messages."""
+        if out and self.pending(out):
+            return (f"run the same command again to collect it: {os.path.basename(out)}{JOB} keeps the job id, so "
+                    f"no new one is paid for (or see {where})")
+        return f"check {where} before running it again, so it isn't paid for twice"
+
+    @staticmethod
+    def earlier(job):
+        """Added to a Result's note when it came from a job an earlier run started."""
+        return f" (finished job {job['id']} started {job.get('started', 'earlier')})" if job else ""
 
     # ---- slots (implement the ones listed in `slots`) ----
 
@@ -155,7 +216,8 @@ def submit(fn, tries=5, base_wait=10):
 
 
 def download(url, out, tries=4):
-    """Save a result. Retried, because by now the job is already paid for."""
+    """Save a result. Retried, because by now the job is already paid for. If the provider has already deleted
+    the file, the job for `out` can't be collected by a re-run either, so its <out>.job.json goes too."""
     os.makedirs(os.path.dirname(os.path.abspath(out)) or ".", exist_ok=True)
     for attempt in range(tries):
         try:
@@ -166,7 +228,16 @@ def download(url, out, tries=4):
             return out
         except (urllib.error.URLError, ConnectionError, TimeoutError, OSError, HTTPException) as e:
             gone = isinstance(e, urllib.error.HTTPError) and e.code in (401, 403, 404, 410)   # retrying won't help
-            if gone or attempt == tries - 1:
+            if gone:
+                try:
+                    os.remove(out + JOB)
+                except OSError:
+                    pass
+                raise ProviderError(f"Made, but the download failed ({e}): the provider no longer has the file at "
+                                    f"{url}, so it can't be collected. Running it again makes a new one (paid).",
+                                    code=e.code)
+            if attempt == tries - 1:
                 raise ProviderError(f"Made, but the download failed ({e}). The file may still be at: {url} "
-                                    f"(providers delete results after a while, so save it soon)")
+                                    f"(providers delete results after a while, so save it soon). Running the same "
+                                    f"command again downloads it without paying again.")
             time.sleep(5 * (attempt + 1))

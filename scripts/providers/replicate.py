@@ -4,7 +4,8 @@ Pattern for every model: upload local files (data URL when small, else POST /v1/
 on the official model (POST /v1/models/{owner}/{name}/predictions) -> poll urls.get -> download the output.
 Docs: https://replicate.com/docs/reference/http. Predictions report no cost, so costs come from each model's
 published price (replicate.com/<owner>/<name>, checked 2026-10-30). Failed runs aren't charged.
-Replicate deletes API inputs and outputs after an hour, so results are downloaded straight away.
+Replicate deletes API inputs and outputs after an hour, so results are downloaded straight away (a prediction an
+earlier run didn't collect, see _base.py <out>.job.json, can be picked up within that hour).
 A community model can be pinned with its version: --model owner/name:<version id>.
 """
 import base64
@@ -123,43 +124,60 @@ class Replicate(Provider):
         d = with_retries(lambda: http("POST", f"{API}/files", headers=h, raw=body, timeout=300))
         return d["urls"]["get"]
 
-    def _run(self, model, inp, timeout=900, every=3):
+    def _run(self, model, inp, timeout=900, every=3, out=None):
         """Create one prediction and poll it to the end. Returns (output URLs, prediction).
 
         The create call is only resent when Replicate turned it away (rate limit); after a network error the
-        prediction may exist, so it stops instead of paying twice. Polling never starts a new one."""
-        if ":" in model:                       # owner/name:version = a community model pinned to a version
-            url, body = f"{API}/predictions", {"version": model, "input": inp}
+        prediction may exist, so it stops instead of paying twice. Polling never starts a new one. With `out`,
+        the prediction id is kept in <out>.job.json until the caller has saved the result, and a prediction an
+        earlier run left there is collected instead of creating one (then `inp` is not used)."""
+        job = self.pending(out)
+        if job:                                # an earlier run's prediction: poll that one, create nothing
+            pid, get, model = job["id"], job.get("poll") or f"{API}/predictions/{job['id']}", job.get("model") or model
+            p = {"id": pid, "status": "collecting"}
         else:
-            url, body = f"{API}/models/{model}/predictions", {"input": inp}
-        p = submit(lambda: http("POST", url, headers=self._h(), body=body))
-        pid = p.get("id", "?")
+            if ":" in model:                   # owner/name:version = a community model pinned to a version
+                url, body = f"{API}/predictions", {"version": model, "input": inp}
+            else:
+                url, body = f"{API}/models/{model}/predictions", {"input": inp}
+            p = submit(lambda: http("POST", url, headers=self._h(), body=body))
+            pid = p.get("id", "?")
+            get = (p.get("urls") or {}).get("get") or f"{API}/predictions/{pid}"
+            self.remember(out, model, p.get("id"), get)
         where = (p.get("urls") or {}).get("web") or f"https://replicate.com/p/{pid}"
-        get = (p.get("urls") or {}).get("get") or f"{API}/predictions/{pid}"
+        earlier = " (started by an earlier run)" if job else ""
         t0 = time.time()
         while p.get("status") not in DONE:
             if time.time() - t0 > timeout:
                 raise ProviderError(f"Replicate prediction {pid} still '{p.get('status')}' after {timeout}s. It may "
-                                    f"still finish (and be charged): see {where} before running it again.")
+                                    f"still finish (and be charged): {self.again(out, where)}.")
             time.sleep(every)
             try:
                 p = with_retries(lambda: http("GET", get, headers=self._h()))
             except ProviderError as e:
+                if job and e.code == 404:
+                    self.forget(out)
+                    raise ProviderError(f"Replicate has no prediction {pid}{earlier} any more, so there is nothing to "
+                                        f"collect. Running it again makes a new one (paid).", code=404) from e
                 raise ProviderError(f"Lost track of Replicate prediction {pid} ({e}). It may still finish: "
-                                    f"see {where} before running it again.", code=e.code) from e
+                                    f"{self.again(out, where)}.", code=e.code) from e
         if p["status"] == "succeeded":
             urls = self._urls(p.get("output"))
             if not urls:
-                raise ProviderError(f"Replicate {model} finished but returned no file ({where})")
+                self.forget(out)
+                gone = ": Replicate deletes results after an hour" if p.get("data_removed") else ""
+                raise ProviderError(f"Replicate {model}{earlier} finished but returned no file ({where}{gone}). "
+                                    f"Running it again makes a new one (paid).")
             return urls, p
+        self.forget(out)                       # failed or canceled: nothing to collect
         err = str(p.get("error") or "no reason given")
         if p["status"] == "failed":
             hint = ""
             if any(w in err.lower() for w in SAFETY_WORDS):
                 hint = (" FIX: it was blocked as unsafe. Soften the prompt or the reference images (often a person "
                         "+ a medical or body detail, or a brand name) and retry.")
-            raise ProviderError(f"Replicate {model} failed (not charged): {err}{hint}")
-        raise ProviderError(f"Replicate {model} was {p['status']}: {err}")
+            raise ProviderError(f"Replicate {model}{earlier} failed (not charged): {err}{hint}")
+        raise ProviderError(f"Replicate {model}{earlier} was {p['status']}: {err}")
 
     @staticmethod
     def _urls(output):
@@ -203,7 +221,8 @@ class Replicate(Provider):
 
     def image(self, prompt, out, refs=(), aspect="9:16", quality="standard", model=None):
         m = self.model_for("image", quality, model)
-        urls = [self.upload(p) for p in refs]
+        job = self.pending(out)                  # an earlier run's prediction: collected below, nothing is uploaded
+        urls = [] if job else [self.upload(p) for p in refs]
         res = IMAGE_RES.get(quality, "2K")
         inp = {"prompt": prompt, "aspect_ratio": aspect}
         if m.startswith("google/nano-banana"):
@@ -225,9 +244,10 @@ class Replicate(Provider):
             inp.update(input_images=urls, output_format="png")
         elif urls:
             inp["image_input"] = urls
-        res_urls, _ = self._run(m, inp, timeout=600, every=2)
+        res_urls, _ = self._run(m, inp, timeout=600, every=2, out=out)
         download(res_urls[0], out)
-        return Result([out], self.estimate("image", quality, model=model), m)
+        self.forget(out)
+        return Result([out], self.estimate("image", quality, model=model), m + self.earlier(job))
 
     # video helpers: talking shots need a model that can make sound; Veo Lite at 1080p must be 8s
 
@@ -246,7 +266,8 @@ class Replicate(Provider):
         asked = self.model_for("video", quality, model)
         m = self._video_model(asked, audio)
         length = snap(m, seconds)
-        frame_url = self.upload(frame) if frame else None
+        job = self.pending(out)
+        frame_url = self.upload(frame) if frame and not job else None
         base = m.split(":")[0]
         inp = {"prompt": prompt + ("" if audio else NO_TEXT), "duration": length, "aspect_ratio": aspect}
         if base.startswith("google/veo-3.1"):
@@ -273,9 +294,10 @@ class Replicate(Provider):
                 inp["image"] = frame_url
         elif frame_url:
             inp["image"] = frame_url
-        urls, _ = self._run(m, inp, timeout=1800, every=5)
+        urls, _ = self._run(m, inp, timeout=1800, every=5, out=out)
         download(urls[0], out)
-        note = f"{m}, {length}s" + ("" if m == asked else f" (talking shot: {asked} makes no sound)")
+        self.forget(out)
+        note = f"{m}, {length}s" + ("" if m == asked else f" (talking shot: {asked} makes no sound)") + self.earlier(job)
         return Result([out], self.estimate("video", quality, seconds=length, model=model, audio=audio), note)
 
     def voices(self):
@@ -297,9 +319,11 @@ class Replicate(Provider):
             inp["style"] = s["style"]
         if s.get("language"):
             inp["language_code"] = s["language"]                          # Replicate's default is "en"
-        urls, _ = self._run(m, inp, timeout=600, every=2)
+        job = self.pending(out)
+        urls, _ = self._run(m, inp, timeout=600, every=2, out=out)
         download(urls[0], out)
-        return Result([out], self.estimate("voice", "standard", model=m, chars=len(text)), m)
+        self.forget(out)
+        return Result([out], self.estimate("voice", "standard", model=m, chars=len(text)), m + self.earlier(job))
 
     @staticmethod
     def _music_seconds(m, seconds):
@@ -319,25 +343,38 @@ class Replicate(Provider):
                    "output_format": "mp3_high_quality"}
         else:                                 # Stable Audio 2.5 (and most others) take a length in seconds
             inp = {"prompt": text, "duration": sec}
-        urls, _ = self._run(m, inp, timeout=900, every=4)
+        job = self.pending(out)
+        urls, _ = self._run(m, inp, timeout=900, every=4, out=out)
         download(urls[0], out)
-        return Result([out], self.estimate("music", "standard", seconds=sec, model=m), f"{m}, {sec}s")
+        self.forget(out)
+        return Result([out], self.estimate("music", "standard", seconds=sec, model=m), f"{m}, {sec}s" + self.earlier(job))
 
     def lipsync(self, video, audio, out, quality="standard", model=None):
         # The output is as long as the line: a longer clip is trimmed, a shorter one plays back and forth.
         m = self.model_for("lipsync", quality, model)
-        inp = {"video": self.upload(video), "audio": self.upload(audio)}
-        if m.startswith("sync/"):
-            inp.update(sync_mode="bounce", temperature=0.5, active_speaker=False)
-        elif m.startswith("heygen/"):
-            inp["enable_dynamic_duration"] = True
-        urls, _ = self._run(m, inp, timeout=1800, every=5)
+        talk = self._seconds(audio)              # measured before the paid job
+        job = self.pending(out)                  # an earlier run's prediction: collected below, nothing is uploaded
+        inp = None
+        if not job:
+            inp = {"video": self.upload(video), "audio": self.upload(audio)}
+            if m.startswith("sync/"):
+                inp.update(sync_mode="bounce", temperature=0.5, active_speaker=False)
+            elif m.startswith("heygen/"):
+                inp["enable_dynamic_duration"] = True
+        urls, _ = self._run(m, inp, timeout=1800, every=5, out=out)
         download(urls[0], out)
-        return Result([out], self.estimate("lipsync", quality, seconds=self._seconds(audio), model=model), m)
+        self.forget(out)
+        return Result([out], self.estimate("lipsync", quality, seconds=talk, model=model), m + self.earlier(job))
 
     def avatar(self, image, audio, out, prompt="", quality="standard", model=None):
         m = self.model_for("avatar", quality, model)
         talk = self._seconds(audio)
+        job = self.pending(out)
+        if job:                                  # an earlier run's prediction: collect it, upload nothing
+            urls, _ = self._run(m, None, timeout=3600, every=10, out=out)
+            download(urls[0], out)
+            self.forget(out)
+            return Result([out], self.estimate("avatar", quality, seconds=talk, model=model), m + self.earlier(job))
         if m == "bytedance/omni-human-1.5" and talk >= 35:
             raise ProviderError(f"OmniHuman 1.5 takes under 35 seconds of audio (this is {talk:.0f}s). "
                                 f"Use the default avatar model, or split the voiceover at a pause.")
@@ -348,8 +385,9 @@ class Replicate(Provider):
             inp["mode"] = KLING_AVATAR_MODE.get(quality, "std")
         elif m == "prunaai/p-video-2-pro-avatar":
             inp.update(resolution="768p", prompt_upsampling=False)   # keep the prompt as written
-        urls, _ = self._run(m, inp, timeout=3600, every=10)
+        urls, _ = self._run(m, inp, timeout=3600, every=10, out=out)
         download(urls[0], out)
+        self.forget(out)
         return Result([out], self.estimate("avatar", quality, seconds=talk, model=model), m)
 
     @staticmethod
