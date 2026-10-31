@@ -8,6 +8,12 @@ import shutil
 import subprocess
 import sys
 
+for _stream in (sys.stdout, sys.stderr):    # a Windows console (cp1252) can't show every character: never crash on one
+    try:
+        _stream.reconfigure(errors="replace")
+    except (AttributeError, ValueError):
+        pass
+
 SKILL_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SETTINGS = os.path.join(SKILL_DIR, "providers.json")
 SPEND_LOG = os.path.join(SKILL_DIR, "spend_log.csv")
