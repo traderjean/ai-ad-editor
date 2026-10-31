@@ -22,7 +22,7 @@ a = ap.parse_args()
 
 from PIL import Image, ImageDraw
 
-with open(os.path.join(a.project, a.shots)) as f:
+with open(os.path.join(a.project, a.shots), encoding="utf-8") as f:
     shots = json.load(f)["shots"]
 qc = os.path.join(a.project, "qc")
 os.makedirs(qc, exist_ok=True)
@@ -31,7 +31,7 @@ os.makedirs(qc, exist_ok=True)
 def frozen_start(clip):
     """Seconds at the start where the picture doesn't change (0 if it moves straight away)."""
     r = subprocess.run([ffmpeg(), "-hide_banner", "-t", "2", "-i", clip, "-vf", "freezedetect=n=0.003:d=0.4",
-                        "-f", "null", "-"], capture_output=True, text=True)
+                        "-f", "null", "-"], capture_output=True, text=True, encoding="utf-8", errors="replace")
     start = end = None
     for line in r.stderr.splitlines():
         if "freeze_start" in line and start is None:

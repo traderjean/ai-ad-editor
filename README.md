@@ -14,7 +14,7 @@ Paste a script. Claude plans every shot, makes the characters, images, clips and
 - **Every size**: 9:16, 4:5, 1:1 and 16:9 from the same edit
 - **The same character in every shot**: one master character sheet, with every other version edited from it
 - **Any kind of voiceover**: your own file, a generated voice, characters talking on screen, an AI presenter, or text on screen with no voice
-- **Checks before delivery**: the voiceover is matched word for word, plus frozen frames, black frames, sizes and file specs
+- **Checks before delivery**: the voiceover is matched word for word, plus frozen frames, black frames, sizes, file specs and your platform's length and file-size limits
 - **Easy revisions**: every draft comes with a shot map (time, shot and line for each shot). Give notes by time, line or description. Claude sorts them into free edits and paid remakes, shows the cost before changing anything, and sends v2 with a list of what changed
 - **Music that sits under the voice**: your track dips automatically while someone speaks, and you can switch to a second track at any line
 
@@ -42,7 +42,7 @@ Paste a script. Claude plans every shot, makes the characters, images, clips and
 
 ## Built for Kie.ai, also works with Replicate and Higgsfield
 
-This skill is built for [Kie.ai](https://kie.ai) and tested on it. One Kie key and one balance cover the images, video clips, lip-sync and talking avatars. If you want generated voiceovers, add an [ElevenLabs](https://elevenlabs.io) key too.
+This skill is built for [Kie.ai](https://kie.ai) and tested on it. One Kie key and one balance cover the images, video clips, voiceovers (a fixed list of ElevenLabs voices), lip-sync and talking avatars. To use your own ElevenLabs voices, add an [ElevenLabs](https://elevenlabs.io) key too.
 
 **Two more ready-made options**, picked at setup. You can mix them: each job (images, video, voice, music, lip-sync) can use a different one.
 
@@ -124,7 +124,7 @@ Claude shows the estimate before every paid run, and you can set a per-run spend
 - Python 3.9+ with `faster-whisper`, `imageio-ffmpeg`, `pillow` and `numpy` (`imageio-ffmpeg` gives you ffmpeg if you don't have it)
 - At least one way to make images and video: an API key, an MCP, or by hand
 
-The first time it times a voiceover, it downloads a small speech model. That takes about a minute, once.
+The first time it times a voiceover, it downloads a small speech model. That takes about a minute, once. A voiceover that isn't in English uses a second, multilingual model, downloaded the same way the first time.
 
 ## What's in here
 

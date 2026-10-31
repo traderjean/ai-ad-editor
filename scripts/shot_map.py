@@ -5,10 +5,12 @@ so notes like "at 0:23" or "the bathroom bit" can be matched to a shot.
 
 Writes <final file without .mp4>_shotmap.jpg next to the draft and prints the same list as text.
 Times are taken from the shots file; frames are taken from the draft itself (what the viewer saw).
+Without --shots, a _hookB_ draft uses shots_hookB.json if there is one, else shots.json.
 """
 import argparse
 import json
 import os
+import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -17,13 +19,17 @@ from common import load_font, mmss, run_ffmpeg
 ap = argparse.ArgumentParser()
 ap.add_argument("project")
 ap.add_argument("final")
-ap.add_argument("--shots", default="shots.json")
+ap.add_argument("--shots")
 ap.add_argument("--cols", type=int, default=6)
 a = ap.parse_args()
 
 from PIL import Image, ImageDraw
 
-with open(os.path.join(a.project, a.shots)) as f:
+if not a.shots:    # the plan this draft was cut from: <project>_hookB_9x16_v1.mp4 -> shots_hookB.json
+    m = re.search(r"_(hook\w+?)(?:_(?:9x16|4x5|1x1|16x9)_|\.mp4$)", os.path.basename(a.final))
+    a.shots = f"shots_{m.group(1)}.json" if m and os.path.exists(os.path.join(a.project, f"shots_{m.group(1)}.json")) \
+        else "shots.json"
+with open(os.path.join(a.project, a.shots), encoding="utf-8") as f:
     shots = json.load(f)["shots"]
 final = a.final if os.path.isabs(a.final) else os.path.join(a.project, a.final)
 tmp = os.path.join(a.project, "qc", "shotmap")
@@ -35,7 +41,12 @@ cells = []
 for s in shots:
     mid = (s["start"] + s["end"]) / 2
     fp = os.path.join(tmp, s["id"] + ".jpg")
+    if os.path.exists(fp):    # left by another draft: never show it for this one
+        os.remove(fp)
     run_ffmpeg(["-ss", f"{mid:.2f}", "-i", final, "-frames:v", "1", "-vf", f"scale={TW}:{TH}", fp])
+    if not os.path.exists(fp):
+        sys.exit(f"{s['id']}: no frame at {mid:.2f}s - the draft is shorter than {a.shots} says. "
+                 "Is it the right shots file for this draft?")
     cells.append((s, Image.open(fp).convert("RGB")))
     print(f'{mmss(s["start"])}-{mmss(s["end"])}  {s["id"]}  {s.get("text", "")}')
 

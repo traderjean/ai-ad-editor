@@ -12,7 +12,7 @@ Takes a finished script and makes the finished video ad. The script is never rew
 - **Library (UGC):** every clip comes from the user's own folder of filmed clips. The skill picks and trims; nothing is generated, so it's free apart from an optional generated voiceover. Steps 6, 7 and 8 are skipped.
 - **Mixed:** library first; any line with no good library clip is made with AI, matched to the library footage. Steps 6 to 8 run only for those shots.
 
-`$S` = this skill's `scripts/` folder. Every script runs with `python3` (on Windows, use `python` instead).
+`$S` = this skill's `scripts/` folder. Every script runs with `python3` (on Windows, use `python` instead). Run them from inside the project folder, so `<project>` in a command is `.` and every other path (`audio/vo.mp3`, `final/<file>.mp4`) is a path inside the project, written the same way as in `shots.json`. The library folder is the only path outside it: give its full path.
 
 ---
 
@@ -55,9 +55,9 @@ Free. Keep it short: the user wants to make an ad, not configure software.
    - **Replicate API token.** Pay per result, every slot (images, video, voice, music, lip-sync, avatars). If `REPLICATE_API_TOKEN` works, confirm "Replicate is connected (account X)". Replicate shows no balance through its API: point them to replicate.com/account/billing. If not set, tell them to make a token at replicate.com/account/api-tokens and add it to their shell profile.
    - **Higgsfield.** Two ways, check both: the **API** (`HF_KEY="<key id>:<secret>"` from console.higgsfield.ai, API keys) makes images and video; the **Higgsfield MCP**, if it's connected in this Claude (tools named `mcp__higgsfield__*`), also does voiceovers and lip-sync, paid in Higgsfield credits (see "Higgsfield MCP" below). Neither makes music: that slot goes to another provider or by hand.
    - **Another tool or by hand.** An MCP they've connected, or another API key: check it and use it. Or manual mode: you write every prompt, they run it in any app.
-4. Save it: `python3 $S/check_setup.py --auto` fills every empty slot from the keys that work (Kie first, then Replicate, then Higgsfield). Or set slots one by one: `--set image=api:replicate --set video=api:replicate --set lipsync=api:replicate`, `--set video=api:higgsfield`, `--set video=mcp:higgsfield`, `--set video=mcp:<tool name>`, `--set video=manual:<app>`. Slots can mix providers (e.g. Higgsfield video, Replicate music).
+4. Save it: `python3 $S/check_setup.py --auto` fills every empty slot from the keys that work (a working ElevenLabs key takes the voice slot; otherwise Kie first, then Replicate, then Higgsfield). Or set slots one by one: `--set image=api:replicate --set video=api:replicate --set lipsync=api:replicate`, `--set video=api:higgsfield`, `--set video=mcp:higgsfield`, `--set video=mcp:<tool name>`, `--set video=manual:<app>`. Slots can mix providers (e.g. Higgsfield video, Replicate music).
 5. **Don't ask about voice, music or lip-sync now.** Each comes up in its own step, only if the ad needs it.
-6. **Models are a choice, not a rule.** When clips come up (Step 8), recommend Veo 3.1 Fast as the place to start (good motion, fair price). `--quality draft|standard|best` picks the provider's model for each tier (table below); `check_setup.py --set video=api:<provider>:<model id>` pins any model the adapter knows. On Kie, the built-in video models are the Veo 3.1 family (`veo3_lite`, `veo3_fast`, `veo3`); other Kie video models (Kling, Seedance and so on) need their own few lines in `scripts/providers/kie.py` before they work. Through an MCP or by hand, any model the user has works. Same for images: Nano Banana 2 to start (Nano Banana 2.1 on Replicate), any other image model if they prefer.
+6. **Models are a choice, not a rule.** When clips come up (Step 8), recommend Veo 3.1 Fast as the place to start (good motion, fair price). `--quality draft|standard|best` picks the provider's model for each tier (table below); `check_setup.py --set video=api:<provider>:<model id>` pins any model the adapter knows (not on the lip-sync slot, which avatars share: there pass `--model <id>` to `generate.py lipsync` or `avatar` each run). On Kie, the built-in video models are the Veo 3.1 family (`veo3_lite`, `veo3_fast`, `veo3`); other Kie video models (Kling, Seedance and so on) need their own few lines in `scripts/providers/kie.py` before they work. Through an MCP or by hand, any model the user has works. Same for images: Nano Banana 2 to start (Nano Banana 2.1 on Replicate), any other image model if they prefer.
 7. Only if ffmpeg or faster-whisper is missing, give the one install line `check_setup.py` prints.
 
 **How each mode works from here on.** Every generation goes through `generate.py`:
@@ -86,7 +86,7 @@ On Replicate and Higgsfield, video is billed per second: `generate.py clips --fi
 **Higgsfield MCP** (`--set <slot>=mcp:higgsfield`). `generate.py` exits with code 3 and prints the prompt and settings; you run the job with the Higgsfield tools and save the file to the path it printed:
 1. Once per conversation: `mcp__higgsfield__get_preferences` (and `balance` to show their credits).
 2. Upload each local file it lists (start frame, references, clip, voiceover): `media_upload` with the filename and content type, a `curl -X PUT --upload-file` to the returned upload URL (must answer 200), then `media_confirm` per media type. A finished Higgsfield job can be passed on by its job id instead. `medias` values are always media or job ids, never URLs.
-3. Price it first with the single tool and `get_cost: true` (e.g. `generate_video` with `{model, prompt, aspect_ratio: "9:16", duration, medias, get_cost: true}`). Quote the credits it returns and wait for a yes. It's priced in credits, not dollars: say so.
+3. Price it first with the single tool and `get_cost: true` (e.g. `generate_video` with `{model, prompt, aspect_ratio: "9:16", duration, medias, get_cost: true}`). The model is the one for the `quality` it printed (tiers below), or the `model` it printed if there is one; `duration` is the `length` it printed. Quote the credits it returns and wait for a yes. It's priced in credits, not dollars: say so.
 4. Submit with the batch tool (`generate_image_batch`, `generate_video_batch`, `generate_audio_batch`, even for one job), then `jobs_wait` (up to 12 jobs, 15s per call) until every job is done. Never resubmit after a timeout: keep the job ids and wait on them, or it is paid twice. Apply any `adjustments` the server returns.
 5. Save each result with `curl -L --fail -o <path it printed> <result url>`; mute a clip that must be silent (`ffmpeg -i in.mp4 -c:v copy -an out.mp4`).
 Models by tier: images `nano_banana` / `nano_banana_2` / `nano_banana_pro` (role `image_references`); video `veo3_1_lite` / `veo3_1` (variant `veo-3-1-fast`) / `kling3_0` (mode `pro`, `sound: "off"`), start frame as role `start_image`; voiceover `seed_audio` or `elevenlabs_v4` with a voice from `list_voices` (`voice_type` + `voice_id`, `format: "mp3"`); lip-sync `sync_so` (roles `input_video` + `input_audio`, `sync_mode: "bounce"`); avatar: make a clip of the photo first, then lip-sync it with `sync_so`. No music.
@@ -106,14 +106,14 @@ Models by tier: images `nano_banana` / `nano_banana_2` / `nano_banana_pro` (role
 - **Start anywhere.** Ask with buttons what they already have, and start at that step: just a script (Step 2) / a script and voiceover (Step 2, voiceover option 1) / their own shot plan (Step 5: check it, then go on) / their own frames or clips (Step 8 or 9: drop them in `frames/` or `clips/` named by shot id) / a project from before (pick up from `state.json`).
 - Then ask with buttons: "Paste your brief" (show the template from `brief-template.md`) or "Ask me the questions" (one question at a time, look first).
 
-**Project folder:** `<brand>-<ad name>/` in the working directory:
+**Project folder:** `<brand>-<ad name>/` in the working directory, with every folder below made up front. Run the scripts from inside it (see `$S` above):
 
 ```
 brief.md  state.json  shots.json  words.json  changes.md
 inputs/  audio/  characters/  frames/  clips/  manual/  qc/  final/
 ```
 
-Brand files: `brands/<brand>/kit.md` (product, buyer, logo, look, avoid list) and `brands/<brand>/learnings.md` (feedback that applies to every ad for that brand). Read both at the start of every ad for that brand.
+Brand files, in the working directory next to the projects: `brands/<brand>/kit.md` (product, buyer, logo, look, avoid list) and `brands/<brand>/learnings.md` (feedback that applies to every ad for that brand). Read both at the start of every ad for that brand.
 
 Update `state.json` at the end of every stage: `{"stage": "<name>", "done": [...], "waiting_on": "<what the user needs to do>"}`.
 
@@ -143,15 +143,15 @@ Use the option from the brief. If it's missing, ask with buttons.
 **2. Generate it.**
 - Voice slot. List voices with `python3 $S/generate.py voices` and pick 3 that fit the buyer (age, gender, accent). Offer them with buttons, one line each. On Kie the voices are a fixed list of ElevenLabs v3 voices, and on Replicate a fixed list of 26 named ElevenLabs voices; a user who wants their own ElevenLabs voices sets `check_setup.py --set voice=api:elevenlabs` with an ElevenLabs key. On the Higgsfield MCP, list voices with `mcp__higgsfield__list_voices`.
 - Save the script as plain text (`inputs/script.txt`) and make one take:
-  `python3 $S/generate.py voice --text-file inputs/script.txt --out audio/vo.mp3 --voice <id>` (estimate, then `--yes`). For a script that isn't in English, add `--language <code>` (e.g. `fr`): Replicate's voices otherwise assume English.
+  `python3 $S/generate.py voice --text-file inputs/script.txt --out audio/vo.mp3 --voice <id>` (estimate, then `--yes`). For a script that isn't in English, add `--language <code>` (e.g. `fr`): Replicate's voices otherwise assume English. Use the same code for the timing (Stage 3) and as `"language"` in the shots file.
 - Show the length. The user listens and approves, or asks for another voice.
 - Save the chosen voice: `check_setup.py --voice-id <id>`, so hooks and later ads match.
 
 **3. Talking characters** (people on screen say the lines). Ask with buttons:
 - **Same voice all the way through (Recommended):** generate the voiceover first (option 2). Later, each talking shot is made as a normal clip of the person facing the camera, then lip-synced to its part of the voiceover (Stage 7). Exact words, one voice.
-- **The video tool makes the voice:** cheaper and faster. Warn the user: the voice can change from clip to clip, and the tool sometimes changes words. Every talking clip is transcribed and any changed word is flagged (Stage 7). There is no voiceover file: the shots file has no `"vo"`, each talking shot sets `"use_clip_audio": true`, and shot lengths come from the lines (about 2.7 spoken words a second). `edit.py` builds the sound from the clips and transcribes it for the captions.
+- **The video tool makes the voice:** cheaper and faster. Warn the user: the voice can change from clip to clip, and the tool sometimes changes words. Every talking clip is transcribed and any changed word is flagged (Stage 7). There is no voiceover file: the shots file has no `"vo"`, each talking shot sets `"use_clip_audio": true`, and shot lengths come from the lines (about 2.7 spoken words a second). `edit.py` builds the sound from the clips and transcribes it for the captions, and does it again by itself when a talking clip is remade, moved or trimmed.
 
-**4. AI talking avatar.** One AI presenter talks to camera for the whole ad, and the avatar video is the voiceover and the main picture. If the user already made the avatar video (in HeyGen or similar), copy it to `inputs/avatar.mp4`. If they have a photo of the presenter (or you make one in Stage 5), make the talking video from the photo and the voiceover. Only the cut-aways are generated as clips:
+**4. AI talking avatar.** One AI presenter talks to camera for the whole ad, and the avatar video is the voiceover and the main picture. If the user already made the avatar video (in HeyGen or similar), copy it to `inputs/avatar.mp4`. Its sound is the voiceover: set `"vo": "inputs/avatar.mp4"` in the shots file (`edit.py` and `verify_vo.py` also use an avatar shot's video as the voiceover by themselves when `"vo"` is missing), and time it like any voiceover (Stage 3). If they have a photo of the presenter (or you make one in Stage 5), make the talking video from the photo and the voiceover. Only the cut-aways are generated as clips:
 `python3 $S/generate.py avatar --image inputs/host.png --audio audio/vo.mp3 --out inputs/avatar.mp4 --prompt "<expression, movement, camera>"`
 
 **5. No voiceover (text on screen).** The story is told in on-screen text over music. Each line is one `"type": "text"` shot with its words in `"text"`; its time on screen = its words ÷ 3 per second, at least 1.5s. The card's background is a clip or image (`"source"`) or a plain colour (`"bg": "#1a1a1a"`). The shots file has no `"vo"`.
@@ -162,8 +162,10 @@ Use the option from the brief. If it's missing, ask with buttons.
 
 ## Stage 3 — Timing (Step 4 of 10)
 
-- **Options 1, 2, 4 and the same-voice route of 3:** `python3 $S/transcribe.py <vo or avatar file> <project> --script inputs/script.txt`. This writes `words.json` (every word with its time) and `shots_draft.json` (one draft shot per idea, none longer than the video slot's `max_seconds`). The times come from Whisper; the words come from the script: words that line up one for one are fixed automatically, and any line it prints as `CHECK BY HAND` you fix in `words.json` yourself.
-- **Option 5:** build `words.json` from the reading speed.
+- **Options 1, 2, 4 and the same-voice route of 3:** `python3 $S/transcribe.py <vo or avatar file> <project> --script inputs/script.txt`. This writes `words.json` (every word with its time) and `shots_draft.json` (one draft shot per idea, none longer than the video slot's `max_seconds`). The times come from Whisper; the words come from the script: words that line up one for one are fixed automatically, and any line it prints as `CHECK BY HAND` you fix in `words.json` yourself: change the word's `"w"` and leave its `"heard"` alone (what Whisper heard, which `verify_vo.py` compares against). An existing `words.json` is kept as `words.json.bak`.
+- **Not in English:** add `--language <code>` (e.g. `fr`), the same code as the voiceover. It uses the multilingual speech model instead of the English-only one.
+- A pause of a second or more can become a draft shot of its own with empty `"text"`: give it a visual, or merge it into the shot next to it.
+- **Option 5:** nothing to time. Each card's length comes from its words (Stage 2), and no `words.json` is needed.
 
 ---
 
@@ -171,11 +173,11 @@ Use the option from the brief. If it's missing, ask with buttons.
 
 Runs once per library, then only for new clips. Free.
 
-1. **Index:** `python3 $S/library.py index <folder>`. It reads every clip's length and shape and saves 4 frames from each into `<folder>/_index/`. Re-run it when clips are added; it only processes new ones.
+1. **Index:** `python3 $S/library.py index <folder>`. It reads every clip's length and shape and saves 4 frames from each into `<folder>/_index/`. Re-run it when clips are added; it only processes new ones. Files it can't read (empty, still copying, no picture) are skipped and listed: tell the user, and index again once they're fixed.
 2. **Look and tag:** `python3 $S/library.py sheet <folder> --page N` makes one image of 12 clips × 4 frames. Look at every page and tag each clip in plain words: who is in it (age, gender), what they do, where, the mood, and whether the product shows: `python3 $S/library.py tag <folder> <clip> "<tags>"`. File names often describe the clip; still check the frames. Note which of the 4 frames is the best moment, so you can set `in`.
 3. **Licence check (once):** ask whether the clips are cleared for use in ads. If they aren't sure, say so in the final README.
 4. **Fit check (before planning, every ad):** read the script next to the library tags and estimate how many lines have a clip that really shows them (the right kind of person, the right action or place). If it's under half, say so plainly before the shot plan, with the reason in one line (what the clips show vs what the script is about), and ask with buttons, with no recommendation (one option costs money, the others don't): **Switch to mixed: the lines with no good clip are made with AI, about $X** (lines × the clip price, plus a frame each) / **Library only: free, using the closest clips, marked in the plan** / **Add clips to the library first**. In mixed mode the same check tells the user up front how many AI shots and roughly what they'll cost.
-5. **Repeats:** `library.py find` ranks clips used in earlier ads lower. Ask once whether to avoid clips used in recent ads; after the final, run `library.py used <folder> <clip> <project>` for every clip in the ad.
+5. **Repeats:** `library.py find` ranks clips used in earlier ads lower. Ask once whether to avoid clips used in recent ads; after the final, run `library.py used <folder> <clip> <brand>-<ad name>` for every clip in the ad.
 
 ## Stage 4 — Shot plan and hooks (Step 5 of 10)
 
@@ -238,7 +240,9 @@ Each hook gets a card:
 - **What we see**, shot by shot, for the first 3 to 5 seconds
 - **Join:** how it flows into the main ad's next line with no jump. Read the hook line followed by line 2 out loud in your head; if it doesn't follow, fix the hook, never line 2.
 
-A new hook line needs its own voiceover: their own file, or generated with the same voice and settings as the main voiceover so the join can't be heard. Each hook is planned in its own file, `shots_hook<letter>.json` (with `"vo": "audio/vo_hook<letter>.mp3"` and its own `words` file). The main ad's clips are reused.
+A new hook line needs its own voiceover: their own file, or generated with the same voice and settings as the main voiceover so the join can't be heard. Each hook is planned in its own file, `shots_hook<letter>.json` (with `"vo": "audio/vo_hook<letter>.mp3"` and its own `words` file). Time it into that words file, so the main ad's `words.json` and `shots_draft.json` stay as they are: `python3 $S/transcribe.py audio/vo_hook<letter>.mp3 <project> --script inputs/script_hook<letter>.txt --words-out words_hook<letter>.json --no-draft`. On the talking-characters route with no voiceover, the hook file still names its own `words` file; `edit.py` fills it from the clips.
+
+The main ad's clips are reused: shots copied unchanged from `shots.json` keep their ids. Any new hook shot gets its own id (e.g. `hB01`, with `frames/hB01.png`); with a main-ad id, `generate.py clips` skips it as already made and the hook plays the main ad's clip.
 
 Any part of any hook can be changed without touching the rest. Adding a hook later is a new card; the main ad is not rebuilt.
 
@@ -273,7 +277,7 @@ One frame per `clip` and `talking` shot (library mode: skip this step; mixed mod
 - Attach **exactly one** character sheet per frame (two sheets blend the faces): `--ref characters/<stage>.png`. Add a place reference if there is one. Prompts say "exactly as the attached sheet" and never describe the face again.
 - Reuse the first approved frame of a place as the reference for later shots there.
 - **Product shots:** the character using the product (holding it, taking it). Attach the master sheet, an approved frame of them, and a clean product photo. Spell out the big label text. Use `--quality best` for these. Check the brand name is spelled right.
-- **4:5 safe zone:** every face, product and key prop sits between 15% and 85% of the frame height. Write it into every prompt: "full-bleed vertical image that fills the whole frame edge to edge, no borders, no bands, no letterbox; the faces and hands are in the middle of the frame, with the scene continuing above and below them". Never write "the top and bottom are background only": image models read it as empty bands. Check every frame for bands before showing the grid. `generate.py image` also checks each tall frame by itself: if it looks letterboxed it remakes it once on the best model (the first take is kept as `<name>_banded.png`) and prints a CHECK line if it still looks off.
+- **4:5 safe zone:** every face, product and key prop sits between 15% and 85% of the frame height. Write it into every prompt: "full-bleed vertical image that fills the whole frame edge to edge, no borders, no bands, no letterbox; the faces and hands are in the middle of the frame, with the scene continuing above and below them". Never write "the top and bottom are background only": image models read it as empty bands. **1:1 is tighter:** when the brief wants 1:1, the square keeps only the middle 22% to 78% of the height, so write that zone into the prompts instead. Check every frame for bands before showing the grid. `generate.py image` and `images` also check each tall frame by themselves: one that looks letterboxed is remade once on the best model (the first take is kept as `<name>_banded.png`). The estimate prints that remake's price on its own line ("not in the total", or "cost unknown" on Higgsfield): say so when you quote it. If the remakes could take the run over the spend limit, they're off for that run. A frame that still looks off, wasn't remade, or whose remake failed (the first take stays in place) gets a CHECK line. No remake with `--quality best` or a set model.
 - **Talking shots:** the person faces the camera, mouth closed and about to speak, front or slightly to one side, no hands in front of the face.
 - One clear action per frame. Describe camera position, the action and the light.
 
@@ -290,13 +294,13 @@ Make the first frame as a test (`generate.py image`). After a yes, put the rest 
 Library mode: skip this step. Mixed mode: the AI rows only.
 
 1. Write each clip's `video_prompt` in `shots.json`: the camera, the movement, one action, the light, in plain words. For `talking` shots made by the video tool, put the exact line in quotes: `she looks at the camera and says: "<line>"`.
-2. Run `python3 $S/generate.py clips <project>` for the estimate. Make 1 or 2 test clips first (`--only s01 s02`), then the rest after a yes. It skips clips that already exist; `--only` remakes the named ones and keeps the old take as `<id>_prev.mp4`. On a provider that bills per second (Replicate, Higgsfield), offer `--fit` with both prices: each clip is its shot's length plus a spare second instead of 8s.
+2. Run `python3 $S/generate.py clips <project>` for the estimate. Make 1 or 2 test clips first (`--only s01 s02`), then the rest after a yes. It skips clips that already exist; `--only` remakes the named ones (clip and talking shots) and keeps a copy of the old take as `<id>_prev.mp4`. The old take stays in place until the new one arrives, so a failed or blocked remake loses nothing. On a provider that bills per second (Replicate, Higgsfield), offer `--fit` with both prices: each clip is its shot's length plus a spare second instead of 8s.
 3. **Check every clip yourself** before showing anything: `python3 $S/contact_sheet.py <project>` writes `qc/contact_sheet.jpg`. Look for warped hands, the face changing, objects changing shape, text appearing, the wrong product. For any clip it flags with a frozen start, set `"in": <seconds>` on that shot so the edit starts after it.
 4. **Talking shots:**
    - **Same-voice route:** cut each talking shot's part out of the voiceover (`audio/<id>.mp3`, using the times in `words.json`), then
      `python3 $S/generate.py lipsync --video clips/<id>.mp4 --audio audio/<id>.mp3 --out clips/<id>_talk.mp4`
-     and point the shot at the lip-synced file with `"clip": "clips/<id>_talk.mp4"`. Use the part of the clip where the person faces the camera (cut it out first if they only turn to the camera partway through). The lip-synced clip is as long as the line: a longer clip is trimmed, a shorter one plays back and forth. Replicate's Sync models move only a mouth that is already moving, so the clip should show the person talking (talking shots are made that way), not a still face.
-   - **Video-tool-voice route:** transcribe every talking clip and compare it with its line. Any changed word is flagged to the user with the clip id; the user decides whether to remake it.
+     and point the shot at the lip-synced file with `"clip": "clips/<id>_talk.mp4"`, leaving `in` at 0 (the take starts on the line's first word). Use the part of the clip where the person faces the camera (cut it out first if they only turn to the camera partway through). The lip-synced clip is as long as the line: a longer clip is trimmed, a shorter one plays back and forth. Replicate's Sync models move only a mouth that is already moving, so the clip should show the person talking (talking shots are made that way), not a still face.
+   - **Video-tool-voice route:** transcribe every talking clip into its own words file, so the project's `words.json` and `shots_draft.json` are left alone: `python3 $S/transcribe.py clips/<id>.mp4 <project> --no-draft --words-out audio/<id>_words.json` (plus `--language <code>` if it isn't English). Compare it with its line. Any changed word is flagged to the user with the clip id; the user decides whether to remake it.
 5. Show the user the contact sheet and the list of clips you suggest remaking, with the reason for each. Remake only on a yes.
 6. On Kie, Veo sometimes refuses a clip with "unable to generate audio". `generate.py` retries by itself (without the no-audio line, then on the other Veo models that cost the same or less; refused tries aren't charged) and notes which model made it. If every try is refused, reword the prompt as below. Replicate and Higgsfield turn the sound off instead, so this doesn't come up there.
 7. If a clip is blocked (usually a safety filter on a person + a medical detail), soften the prompt and say what you changed. If credit runs out, stop, say so, and offer to finish the edit with the start frames as stills for the missing shots.
@@ -307,16 +311,16 @@ Library mode: skip this step. Mixed mode: the AI rows only.
 
 ## Stage 8 — Edit (Step 9 of 10)
 
-1. **Music (always ask, never default to none).** Before the first edit, ask with buttons, with no option marked as recommended (music is taste): "Music under the ad?" Attach a track / Two tracks, switching at a line / Make a backing track for this concept / No music. "Make a backing track" writes a short mood prompt from the concept and runs `generate.py music --prompt "..." --out inputs/music.mp3 --seconds <ad length + 2>`: on Kie, 2 instrumental takes with Suno (about 6¢) and the user picks one; on Replicate, one instrumental take of exactly that length (estimate first). Otherwise it uses whatever music tool fills the music slot (Higgsfield has none); otherwise write a short music prompt (mood, tempo, instruments, "instrumental, no vocals") for them to run in any music app and drop the file into `inputs/`. Save the answer to house rules so the next ad asks only to confirm.
+1. **Music (always ask, never default to none).** Before the first edit, ask with buttons, with no option marked as recommended (music is taste): "Music under the ad?" Attach a track / Two tracks, switching at a line / Make a backing track for this concept / No music. "Make a backing track" writes a short mood prompt from the concept and runs `generate.py music --prompt "..." --out inputs/music.mp3 --seconds <ad length + 2>`: on Kie, 2 instrumental takes with Suno and the user picks one; on Replicate, one instrumental take of exactly that length (estimate first). Otherwise it uses whatever music tool fills the music slot (Higgsfield has none); otherwise write a short music prompt (mood, tempo, instruments, "instrumental, no vocals") for them to run in any music app and drop the file into `inputs/`. Save the answer to house rules so the next ad asks only to confirm.
 2. `python3 $S/edit.py <project> --preview` for a fast low-res check, then `python3 $S/edit.py <project>` for the full export.
-3. What the edit does: cuts every clip to its exact slot, frame-accurate, at 1080x1920; the voiceover is the only voice (or, on the talking-characters route where the video tool makes the voice, the clips' own voices); music sits under it and dips automatically while someone speaks (`"duck": false` turns that off); captions from `words.json`; end card if picked.
+3. What the edit does: cuts every clip to its exact slot, frame-accurate, at 1080x1920; the voiceover is the only voice (or, on the talking-characters route where the video tool makes the voice, the clips' own voices); music sits under it and dips automatically while someone speaks (`"duck": false` turns that off); captions from `words.json`; end card if picked. It stops and names the shot when shots don't touch end to end, a shot is shorter than one frame, or a shot would start at or past the end of its clip (its `in`), and when the joined picture comes out the wrong length: fix the shots file (or the clip) and run it again. On the talking-characters route with no voiceover it writes `words.json` from the clips' voices (and `words.json.src`, which clips it heard): hand fixes in `words.json` stay while those clips stay the same, and a remade, moved or trimmed talking clip is transcribed again by itself. Delete `words.json` to force a new one.
 4. **Captions** use the preset from the brief:
    - **Bold:** full capitals, 1 line, the current word highlighted; long words shrink to fit
-   - **Clean:** lower case, up to 2 lines
+   - **Clean:** the script's own capitals (not all caps), up to 2 lines
    - **None**
    - Never 3 lines. Captions sit in the middle of the frame, or just below the main face or object when that is in the middle. Never at the top, and always above the platform's bottom buttons.
-5. **Then always** run `python3 $S/verify_vo.py <project> final/*.mp4`. It checks the final's sound against the voiceover and every word. Never deliver a file that fails it.
-6. Save `final/<brand>_<ad>_hookA_9x16_v1.mp4`, a new version number for every change.
+5. **Then always** run `python3 $S/verify_vo.py <project>`. It checks the newest take of every final in `final/` (not previews or older `_v<n>` takes) against the plan it was cut from (a `_hookB_` file against `shots_hookB.json`): its sound against the voiceover, and every word. A text-only ad (option 5, every shot a text card) has no speech to check and passes. Never deliver a file that fails it.
+6. `edit.py` saves `final/<brand>-<ad name>_hookA_9x16_v1.mp4`, with a new version number for every change.
 
 ⛔ **Gate:** the user reviews the final.
 
@@ -334,7 +338,7 @@ Library mode: skip this step. Mixed mode: the AI rows only.
   "shots": [
     {"id": "s01", "start": 0.0, "end": 2.4, "type": "clip", "text": "<the line>", "visual": "<what we see>",
      "frame": "frames/s01.png", "video_prompt": "..."},
-    {"id": "s02", "start": 2.4, "end": 4.8, "type": "talking", "clip": "clips/s02_talk.mp4", "in": 2.4},
+    {"id": "s02", "start": 2.4, "end": 4.8, "type": "talking", "clip": "clips/s02_talk.mp4"},
     {"id": "s03", "start": 4.8, "end": 7.0, "type": "image", "source": "inputs/product.jpg", "caption_pos": "low"},
     {"id": "s04", "start": 7.0, "end": 9.0, "type": "avatar", "source": "inputs/avatar.mp4"},
     {"id": "s05", "start": 9.0, "end": 11.0, "type": "text", "text": "<on-screen words>", "bg": "#1a1a1a"}
@@ -345,13 +349,15 @@ Library mode: skip this step. Mixed mode: the AI rows only.
 }
 ```
 
-- Shots touch end to end (each `start` = the previous `end`). The last shot runs to the end of the voiceover by itself.
-- `in`: where to start inside the clip (skips a frozen start). For `avatar` it defaults to the shot's `start`, so the avatar stays in sync.
+- Shots touch end to end, in time order: the first starts at 0 and each `start` = the previous `end`. `edit.py` stops and names the shot if not. The last shot runs to the end of the voiceover by itself.
+- `in`: where to start inside the clip (skips a frozen start). For `avatar` it defaults to the shot's `start`, so the avatar stays in sync. Lip-synced talking clips start on the line, so leave `in` at 0 on them.
 - `clip`: use a different file than `clips/<id>.mp4` (a lip-synced take).
 - `"type": "library"` with `"source": "<library folder>/<clip>"` plays a clip from the user's library from `in` seconds (default 0). Its own sound is muted unless `use_clip_audio` is set. Horizontal clips are cropped to the middle of the frame.
-- `on_screen`: extra words shown on any shot (an offer, a label). `text_pos` moves them (0.5 = middle).
+- `on_screen`: extra words shown on any shot (an offer, a label). `text_pos` moves them (0.5 = middle). For a 1:1 version keep `text_pos` from 0.25 to 0.75 and `caption_pos` at most 0.75 (`"low"` is fine): the square cuts off the rest.
 - `use_clip_audio`: keep the clip's own sound (the video tool's voice).
 - `quality` per shot or for the whole file: `draft`, `standard` (default) or `best`.
+- `language`: the voiceover's language code (e.g. `"fr"`) when it isn't English. `verify_vo.py` and `qc.py` use it to hear the words.
+- `platform`: `"meta"`, `"tiktok"` or `"youtube"`, from the brief. `qc.py` checks that platform's length and file-size limits (meta if it's missing).
 - A shot with no clip yet plays its start frame as a still, so an edit can always be made.
 - `captions`: `{"preset": "bold"}`, `{"preset": "clean"}`, `{"preset": "none"}` or `false`. Extra keys override the preset: `size`, `font`, `font_file`, `colour`, `highlight`, `max_words`.
 - `music.volume` 0.08 to 0.15 sits under a voice; text-only ads can go up to 0.3. The music dips under speech by itself; `"duck": false` keeps it level.
@@ -364,16 +370,16 @@ Library mode: skip this step. Mixed mode: the AI rows only.
 From the brief:
 
 - **Hooks:** `python3 $S/generate.py clips <project> --shots shots_hookB.json` makes only that hook's new clips, then `python3 $S/edit.py <project> --shots shots_hookB.json` cuts that version.
-- **Sizes:** `python3 $S/variants.py <project> --sizes 4x5 1x1 16x9`. The 4:5 safe zone makes 4:5 and 1:1 work without losing faces.
+- **Sizes:** `python3 $S/variants.py <project> --sizes 4x5 1x1 16x9`. 4x5 keeps 15% to 85% of the height, so the 4:5 safe zone keeps faces and products in it. 1x1 is a centre crop that keeps only the middle 22% to 78%: look at every 1x1 file for cut-off faces, products, captions or text (`variants.py` reminds you).
 - **Shorter cuts (15s, 30s):** suggest which lines to keep and show the shorter script; cut only after a yes. Shorter cuts need a voiceover recorded for that length (or option 5); the voiceover is never cut mid-sentence.
 
-Run `verify_vo.py` on every variant.
+Run `python3 $S/verify_vo.py <project>` again: it checks every hook and size in `final/`, each against its own plan.
 
 ---
 
 ## Stage 10 — Checks and delivery (end of Step 10)
 
-1. `python3 $S/qc.py <project>` runs every check on every file in `final/`: size and shape, H.264 and AAC, sound runs the full length, no black picture, frozen picture flagged, length and file size for the platform, and the voiceover check. It does not check captions: look at a few frames yourself to make sure no caption covers a face or sits under the app's buttons.
+1. `python3 $S/qc.py <project> --platform <meta|tiktok|youtube>` (the brief's platform; it can be left out when the shots file has `"platform"`) runs every check on the newest take of every file in `final/` (not previews or older `_v<n>` takes): size and shape, H.264 and AAC, sound and picture both run the full length, no black picture (a dark text card is only noted: look at a frame of it), frozen picture flagged, length and file size for the platform, and the voiceover check on 9:16 files whose ad speaks (a voiceover, an avatar or clip voices). It does not check captions: look at a few frames yourself to make sure no caption covers a face or sits under the app's buttons.
 2. Fix anything that fails before sending.
 3. Write `final/README.md`: every file made, which tools made it, the cost where known, and anything missing or replaced with a still.
 4. Send the finals to the user. If a Drive or Dropbox tool is connected and the user wants it, upload them there.
@@ -384,7 +390,7 @@ Run `verify_vo.py` on every variant.
 
 The user watches the draft and gives notes like they would to an editor. This step is a loop: draft → notes → plan → v2 → notes, until they're happy.
 
-**1. Every draft goes out with a shot map.** After each edit run `python3 $S/shot_map.py <project> final/<draft>.mp4`. It makes one image of every shot with its time, id and line (`final/<draft>_shotmap.jpg`). Send the draft and the shot map together, and say: "Give notes any way you like: a time (0:23), a line ('when she says carpet'), or a description ('the bathroom bit')."
+**1. Every draft goes out with a shot map.** After each edit run `python3 $S/shot_map.py <project> final/<draft>.mp4` (a hook draft uses its own `shots_hook<letter>.json` by itself). It makes one image of every shot with its time, id and line (`final/<draft>_shotmap.jpg`). Send the draft and the shot map together, and say: "Give notes any way you like: a time (0:23), a line ('when she says carpet'), or a description ('the bathroom bit')."
 
 **2. Turn every note into a shot.** Match times to shots with the shots file, lines with `words.json`, and descriptions with the shot map. If a note could mean two shots, ask which, with the two thumbnails.
 
@@ -437,5 +443,6 @@ When the user brings several briefs at once (a doc or a folder):
 | Clip blocked by a safety filter | Soften the prompt (often a person + a medical detail), retry once, then ask |
 | Veo says it was "unable to generate audio" | Reword the clip prompt: no brand names or written words, nothing that sounds like talking (ask, say, tell). Not charged |
 | Provider busy | `generate.py` waits and retries by itself; failed jobs are normally not charged |
+| A job failed but may be paid for | An error that says "may have started", "may still finish", "Lost track" or "Made, but the download failed" (the summary lists the job as "may have been made and charged anyway") is not like other failures: never just run it again. Check the provider first (its dashboard, the ElevenLabs history, the Kie logs with the task id it printed), or fetch the file from the URL it printed |
 | Credit runs out halfway | Stop, say so, finish with stills for missing shots, list them in the README |
 | Clip opens on a frozen or storyboard frame | The contact sheet check; start the cut after it |

@@ -108,7 +108,9 @@ class Kie(Provider):
                             "and anything that sounds like talking (ask, say, tell).")
                 raise ProviderError(f"Kie task failed ({d.get('failCode')}): {d.get('failMsg')}{hint}", retry=busy)
             if time.time() - t0 > timeout:
-                raise ProviderError(f"Kie task {task} still '{state}' after {timeout}s", retry=False)
+                raise ProviderError(f"Kie task {task} still '{state}' after {timeout}s. It may still finish (and be "
+                                    f"charged): check the logs at kie.ai (task id {task}) before running it again, "
+                                    f"so it isn't paid for twice.", retry=False)
             time.sleep(every)
 
     # ---- contract ----

@@ -7,7 +7,8 @@
     library.py used <folder> <clip> <project> mark a clip as used (so later ads can avoid repeats)
 
 The index lives in <folder>/_index/index.json and is updated, never rebuilt: new clips are added,
-tags you wrote are kept. Frames are in <folder>/_index/frames/.
+tags you wrote are kept. Frames are in <folder>/_index/frames/. Files that can't be read (empty,
+still copying, no picture) are skipped and listed; index again once they're fixed.
 """
 import argparse
 import datetime
@@ -32,7 +33,7 @@ def paths(folder):
 def load(folder):
     _, ip, _ = paths(folder)
     if os.path.exists(ip):
-        with open(ip) as f:
+        with open(ip, encoding="utf-8") as f:
             return json.load(f)
     return {"clips": {}}
 
@@ -40,12 +41,14 @@ def load(folder):
 def save(folder, data):
     idx, ip, _ = paths(folder)
     os.makedirs(idx, exist_ok=True)
-    with open(ip, "w") as f:
+    with open(ip + ".tmp", "w", encoding="utf-8") as f:
         json.dump(data, f, indent=1)
+    os.replace(ip + ".tmp", ip)     # never a half-written index: the tags in it are hand work
 
 
 def size_of(path):
-    r = subprocess.run([ffmpeg(), "-hide_banner", "-i", path], capture_output=True, text=True).stderr
+    r = subprocess.run([ffmpeg(), "-hide_banner", "-i", path], capture_output=True, text=True,
+                       encoding="utf-8", errors="replace").stderr
     m = re.search(r"Video:.*?, (\d{2,5})x(\d{2,5})", r)
     w, h = (int(m.group(1)), int(m.group(2))) if m else (0, 0)
     if re.search(r"rotate\s*:\s*-?90|displaymatrix: rotation of -?90", r):
@@ -57,33 +60,42 @@ def cmd_index(a):
     data = load(a.folder)
     _, _, fr = paths(a.folder)
     os.makedirs(fr, exist_ok=True)
-    files = sorted(f for f in os.listdir(a.folder) if f.lower().endswith(VIDEO))
-    new = 0
-    for f in files:
-        if f in data["clips"]:
-            continue
-        p = os.path.join(a.folder, f)
-        d = duration(p)
-        w, h = size_of(p)
-        frames = []
-        for k in range(4):
-            t = d * (k + 0.5) / 4
-            out = os.path.join(fr, f"{os.path.splitext(f)[0]}_{k + 1}.jpg")
-            run_ffmpeg(["-ss", f"{t:.2f}", "-i", p, "-frames:v", "1", "-vf", "scale=-2:320", out])
-            frames.append({"t": round(t, 2), "file": os.path.relpath(out, a.folder)})
-        data["clips"][f] = {"seconds": round(d, 2), "w": w, "h": h,
-                            "shape": "vertical" if h > w else ("square" if h == w else "horizontal"),
-                            "frames": frames, "tags": "", "used_in": []}
-        new += 1
-        print(f"  {f}  {d:.1f}s  {w}x{h}")
-    gone = [f for f in data["clips"] if f not in files]
-    for f in gone:
-        del data["clips"][f]
-    save(a.folder, data)
+    # "._clip.mp4" files are macOS copy leftovers, not clips
+    files = sorted(f for f in os.listdir(a.folder) if f.lower().endswith(VIDEO) and not f.startswith("._"))
+    new, skipped = 0, []
+    try:
+        for f in files:
+            if f in data["clips"]:
+                continue
+            p = os.path.join(a.folder, f)
+            try:        # duration() and run_ffmpeg() exit on a file they can't read: skip it, keep going
+                d = duration(p)
+                w, h = size_of(p)
+                frames = []
+                for k in range(4):
+                    t = d * (k + 0.5) / 4
+                    out = os.path.join(fr, f"{f}_{k + 1}.jpg")     # full name: clip.mov and clip.mp4 don't share frames
+                    run_ffmpeg(["-ss", f"{t:.2f}", "-i", p, "-frames:v", "1", "-vf", "scale=-2:320", out])
+                    frames.append({"t": round(t, 2), "file": os.path.relpath(out, a.folder)})
+            except SystemExit:
+                skipped.append(f)
+                continue
+            data["clips"][f] = {"seconds": round(d, 2), "w": w, "h": h,
+                                "shape": "vertical" if h > w else ("square" if h == w else "horizontal"),
+                                "frames": frames, "tags": "", "used_in": []}
+            new += 1
+            print(f"  {f}  {d:.1f}s  {w}x{h}")
+    finally:            # even if stopped part way, the clips done so far are kept
+        gone = [f for f in data["clips"] if f not in files]
+        for f in gone:
+            del data["clips"][f]
+        save(a.folder, data)
+    for f in skipped:
+        print(f"  skipped {f}: can't be read (empty, still copying, or no picture)")
     untagged = sum(1 for c in data["clips"].values() if not c["tags"])
     pages = (len(data["clips"]) + PER_PAGE - 1) // PER_PAGE
-    print(f"{len(data['clips'])} clips ({new} new, {len(gone)} removed). {untagged} still need tags. "
-          f"Look at them with: library.py sheet <folder> --page 1..{pages}")
+    print(f"{len(data['clips'])} clips ({new} new, {len(gone)} removed, {len(skipped)} skipped). {untagged} still need "
+          f"tags. Look at them with: library.py sheet <folder> --page 1..{pages}")
 
 
 def cmd_sheet(a):
@@ -130,15 +142,17 @@ def cmd_tag(a):
 
 
 def words(text):
-    return set(re.findall(r"[a-z]+", text.lower().replace("_", " ")))
+    """The words in a text, lower case, accents kept; "she's" -> "shes", not "she" + "s"."""
+    return set(re.findall(r"[^\W\d_]+", text.casefold().replace("'", "").replace("\u2019", "")))
 
 
 def cmd_find(a):
     data = load(a.folder)
-    q = words(a.words) - {"the", "a", "and", "my", "i", "to", "of", "in", "on", "it", "was", "her", "his", "is"}
+    # 1-2 letter words ("m" from "I'm") would match the start of almost any tag
+    q = {w for w in words(a.words) if len(w) > 2} - {"the", "and", "was", "her", "his"}
     scored = []
     for n, c in data["clips"].items():
-        name = " ".join(re.findall("[a-z]+", re.sub(r"([a-z])([A-Z])", r"\1 \2", n).lower()))
+        name = re.sub(r"([a-z])([A-Z])", r"\1 \2", os.path.splitext(n)[0])    # not the extension: "mov" isn't a tag
         hay = words(name + " " + c["tags"])
         hits = sum(1 for w in q if any(h.startswith(w[:5]) for h in hay))
         if hits:
