@@ -124,13 +124,14 @@ class Replicate(Provider):
         d = with_retries(lambda: http("POST", f"{API}/files", headers=h, raw=body, timeout=300))
         return d["urls"]["get"]
 
-    def _run(self, model, inp, timeout=900, every=3, out=None):
+    def _run(self, model, inp, timeout=900, every=3, out=None, usd=None, note=None):
         """Create one prediction and poll it to the end. Returns (output URLs, prediction).
 
         The create call is only resent when Replicate turned it away (rate limit); after a network error the
         prediction may exist, so it stops instead of paying twice. Polling never starts a new one. With `out`,
         the prediction id is kept in <out>.job.json until the caller has saved the result, and a prediction an
-        earlier run left there is collected instead of creating one (then `inp` is not used)."""
+        earlier run left there is collected instead of creating one (then `inp` is not used). usd/note = what
+        this prediction is expected to cost and what it is, kept in the job file for a re-run's spend line."""
         job = self.pending(out)
         if job:                                # an earlier run's prediction: poll that one, create nothing
             pid, get, model = job["id"], job.get("poll") or f"{API}/predictions/{job['id']}", job.get("model") or model
@@ -143,7 +144,7 @@ class Replicate(Provider):
             p = submit(lambda: http("POST", url, headers=self._h(), body=body))
             pid = p.get("id", "?")
             get = (p.get("urls") or {}).get("get") or f"{API}/predictions/{pid}"
-            self.remember(out, model, p.get("id"), get)
+            self.remember(out, model, p.get("id"), get, usd=usd, note=note)
         where = (p.get("urls") or {}).get("web") or f"https://replicate.com/p/{pid}"
         earlier = " (started by an earlier run)" if job else ""
         t0 = time.time()
@@ -167,7 +168,7 @@ class Replicate(Provider):
                 self.forget(out)
                 gone = ": Replicate deletes results after an hour" if p.get("data_removed") else ""
                 raise ProviderError(f"Replicate {model}{earlier} finished but returned no file ({where}{gone}). "
-                                    f"Running it again makes a new one (paid).")
+                                    f"Running it again makes a new one (paid).", made=True, cost=usd)
             return urls, p
         self.forget(out)                       # failed or canceled: nothing to collect
         err = str(p.get("error") or "no reason given")
@@ -244,10 +245,11 @@ class Replicate(Provider):
             inp.update(input_images=urls, output_format="png")
         elif urls:
             inp["image_input"] = urls
-        res_urls, _ = self._run(m, inp, timeout=600, every=2, out=out)
-        download(res_urls[0], out)
+        usd, note = self.bought(job, self.estimate("image", quality, model=model), m)
+        res_urls, _ = self._run(m, inp, timeout=600, every=2, out=out, usd=usd, note=note)
+        download(res_urls[0], out, cost=usd)
         self.forget(out)
-        return Result([out], self.estimate("image", quality, model=model), m + self.earlier(job))
+        return Result([out], usd, note)
 
     # video helpers: talking shots need a model that can make sound; Veo Lite at 1080p must be 8s
 
@@ -294,11 +296,12 @@ class Replicate(Provider):
                 inp["image"] = frame_url
         elif frame_url:
             inp["image"] = frame_url
-        urls, _ = self._run(m, inp, timeout=1800, every=5, out=out)
-        download(urls[0], out)
+        note = f"{m}, {length}s" + ("" if m == asked else f" (talking shot: {asked} makes no sound)")
+        usd, note = self.bought(job, self.estimate("video", quality, seconds=length, model=model, audio=audio), note)
+        urls, _ = self._run(m, inp, timeout=1800, every=5, out=out, usd=usd, note=note)
+        download(urls[0], out, cost=usd)
         self.forget(out)
-        note = f"{m}, {length}s" + ("" if m == asked else f" (talking shot: {asked} makes no sound)") + self.earlier(job)
-        return Result([out], self.estimate("video", quality, seconds=length, model=model, audio=audio), note)
+        return Result([out], usd, note)
 
     def voices(self):
         # The ElevenLabs models on Replicate take a voice name from a fixed list (not the user's own ElevenLabs
@@ -320,10 +323,11 @@ class Replicate(Provider):
         if s.get("language"):
             inp["language_code"] = s["language"]                          # Replicate's default is "en"
         job = self.pending(out)
-        urls, _ = self._run(m, inp, timeout=600, every=2, out=out)
-        download(urls[0], out)
+        usd, note = self.bought(job, self.estimate("voice", "standard", model=m, chars=len(text)), m)
+        urls, _ = self._run(m, inp, timeout=600, every=2, out=out, usd=usd, note=note)
+        download(urls[0], out, cost=usd)
         self.forget(out)
-        return Result([out], self.estimate("voice", "standard", model=m, chars=len(text)), m + self.earlier(job))
+        return Result([out], usd, note)
 
     @staticmethod
     def _music_seconds(m, seconds):
@@ -344,10 +348,11 @@ class Replicate(Provider):
         else:                                 # Stable Audio 2.5 (and most others) take a length in seconds
             inp = {"prompt": text, "duration": sec}
         job = self.pending(out)
-        urls, _ = self._run(m, inp, timeout=900, every=4, out=out)
-        download(urls[0], out)
+        usd, note = self.bought(job, self.estimate("music", "standard", seconds=sec, model=m), f"{m}, {sec}s")
+        urls, _ = self._run(m, inp, timeout=900, every=4, out=out, usd=usd, note=note)
+        download(urls[0], out, cost=usd)
         self.forget(out)
-        return Result([out], self.estimate("music", "standard", seconds=sec, model=m), f"{m}, {sec}s" + self.earlier(job))
+        return Result([out], usd, note)
 
     def lipsync(self, video, audio, out, quality="standard", model=None):
         # The output is as long as the line: a longer clip is trimmed, a shorter one plays back and forth.
@@ -361,20 +366,22 @@ class Replicate(Provider):
                 inp.update(sync_mode="bounce", temperature=0.5, active_speaker=False)
             elif m.startswith("heygen/"):
                 inp["enable_dynamic_duration"] = True
-        urls, _ = self._run(m, inp, timeout=1800, every=5, out=out)
-        download(urls[0], out)
+        usd, note = self.bought(job, self.estimate("lipsync", quality, seconds=talk, model=model), m)
+        urls, _ = self._run(m, inp, timeout=1800, every=5, out=out, usd=usd, note=note)
+        download(urls[0], out, cost=usd)
         self.forget(out)
-        return Result([out], self.estimate("lipsync", quality, seconds=talk, model=model), m + self.earlier(job))
+        return Result([out], usd, note)
 
     def avatar(self, image, audio, out, prompt="", quality="standard", model=None):
         m = self.model_for("avatar", quality, model)
         talk = self._seconds(audio)
         job = self.pending(out)
+        usd, note = self.bought(job, self.estimate("avatar", quality, seconds=talk, model=model), m)
         if job:                                  # an earlier run's prediction: collect it, upload nothing
-            urls, _ = self._run(m, None, timeout=3600, every=10, out=out)
-            download(urls[0], out)
+            urls, _ = self._run(m, None, timeout=3600, every=10, out=out, usd=usd)
+            download(urls[0], out, cost=usd)
             self.forget(out)
-            return Result([out], self.estimate("avatar", quality, seconds=talk, model=model), m + self.earlier(job))
+            return Result([out], usd, note)
         if m == "bytedance/omni-human-1.5" and talk >= 35:
             raise ProviderError(f"OmniHuman 1.5 takes under 35 seconds of audio (this is {talk:.0f}s). "
                                 f"Use the default avatar model, or split the voiceover at a pause.")
@@ -385,10 +392,10 @@ class Replicate(Provider):
             inp["mode"] = KLING_AVATAR_MODE.get(quality, "std")
         elif m == "prunaai/p-video-2-pro-avatar":
             inp.update(resolution="768p", prompt_upsampling=False)   # keep the prompt as written
-        urls, _ = self._run(m, inp, timeout=3600, every=10, out=out)
-        download(urls[0], out)
+        urls, _ = self._run(m, inp, timeout=3600, every=10, out=out, usd=usd, note=note)
+        download(urls[0], out, cost=usd)
         self.forget(out)
-        return Result([out], self.estimate("avatar", quality, seconds=talk, model=model), m)
+        return Result([out], usd, note)
 
     @staticmethod
     def _seconds(path):

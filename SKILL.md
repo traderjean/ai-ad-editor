@@ -442,7 +442,7 @@ The user watches the draft and gives notes like they would to an editor. This st
 
 **3. Sort the notes into free and paid, and show the plan before changing anything:**
 
-| Free (edit only, instant) | Paid (makes something new) |
+| Free (edit only: a minute or two to re-render; unchanged shots are reused) | Paid (makes something new) |
 |---|---|
 | Swap a shot for another existing clip or frame | A new clip or frame |
 | Trim, extend, move or reorder shots | A new character look |
@@ -474,6 +474,13 @@ When the user brings several briefs at once (a doc or a folder):
 3. Build the ads one after another. Keep `batch-status.md` up to date: each ad's stage (planned, frames, clips, edited, checked, delivered) and anything waiting on the user.
 
 ---
+
+**Also good to know:**
+- `transcribe.py --trust-script` never times script words after the voiceover's last heard word: it prints `CHECK BY HAND ... the voiceover ends before the script does`. Listen to the take: if it was cut off or skips a line, make it again; if the script just has extra words, it's fine.
+- A voiceover with music or room tone after its last word is only noted by `verify_vo.py` (it prints a trim command if you want it shorter).
+- Only one paid `generate.py` run per project at a time: a second one stops and says so. A job that was made but couldn't be downloaded is logged with its cost and collected by running the same command again.
+- `hook.py` keeps your hand-fixed words (it reuses `words.json` for the kept part) and works for text-only ads (`hook.py . B --line "..."`).
+- A see-through picture (logo, cut-out product) is shown on black; edit.py notes it.
 
 ## Common problems and the rule that prevents them
 

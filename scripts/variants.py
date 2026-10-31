@@ -48,7 +48,7 @@ if a.files:
         sys.exit(f"No such file: {', '.join(gone)} (give it from the project folder or from the working folder).")
 else:
     newest, older = {}, []      # older _v<n> takes stay in final/ for history: sizes are made of the newest
-    for f in sorted(glob.glob(os.path.join(a.project, "final", "*_9x16_*.mp4"))):
+    for f in sorted(glob.glob(os.path.join(glob.escape(a.project), "final", "*_9x16_*.mp4"))):
         if os.path.basename(f).startswith("preview_"):
             continue
         m = re.match(r"(.*)_v(\d+)\.mp4$", os.path.basename(f))
