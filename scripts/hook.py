@@ -31,7 +31,7 @@ import unicodedata
 import wave
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from common import CLIP_TYPES, clip_path, ffmpeg, load_audio, load_json, mmss, run_ffmpeg, voiceover_file
+from common import CLIP_TYPES, clip_path, ffmpeg, load_audio, load_json, mmss, run_ffmpeg, sentence_end, voiceover_file
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -71,7 +71,7 @@ def norm(t):
 
 
 def ends_sentence(w):
-    return w.rstrip("\"'”’»)]").endswith((".", "?", "!", "…"))
+    return sentence_end(w)       # "a.m." or "Dr." doesn't end one
 
 
 # ---------- the main plan, its voiceover and words ----------
@@ -110,7 +110,7 @@ if os.path.normpath(vo_rel) == os.path.normpath(vo_out):
              "voiceover, or pick another letter.")
 words_rel = data.get("words") or "words.json"
 timing = f"python3 $S/transcribe.py {vo_rel} . --script inputs/script.txt"
-words = load_json(os.path.normpath(os.path.join(P, words_rel)), f"Time the voiceover first: {timing}")
+words = load_json(os.path.normpath(os.path.join(P, words_rel)), f"Time the voiceover (again): {timing}")
 if not isinstance(words, list) or not all(isinstance(w, dict) and number(w.get("s")) and number(w.get("e"))
                                           for w in words):
     sys.exit(f'{words_rel} isn\'t a list of words ({{"w", "s", "e"}}). Time the voiceover again: {timing}')
@@ -121,9 +121,15 @@ probe = subprocess.run([ffmpeg(), "-hide_banner", "-i", vo], capture_output=True
                        errors="replace").stderr
 m = re.search(r"Duration: (\d+):(\d+):([\d.]+)", probe)
 vo_len = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3)) if m else 0
+if " Audio: " not in probe:
+    sys.exit(f"The main voiceover {vo_rel} has no sound in it. Put the real voiceover back (or fix shots.json's "
+             '"vo"), then run this again.')
 if words[-1]["e"] > vo_len + 0.5:
     sys.exit(f"{words_rel} ends at {words[-1]['e']:.1f}s but {vo_rel} is {vo_len:.1f}s long: it was made from another "
              f"take, so the cut would land in the wrong place. Time this voiceover again first: {timing}")
+if vo_len - words[-1]["e"] > 2.0:       # trailing silence is fine, a longer take isn't: say so, the join check below hears it
+    print(f"WARNING {words_rel} ends at {words[-1]['e']:.1f}s but {vo_rel} is {vo_len:.1f}s long. If the voiceover is a "
+          f"new take, time it again first ({timing}), or the cut lands in the wrong place.")
 lang = a.language or data.get("language")
 
 
@@ -147,7 +153,7 @@ k = first_word(kept)
 if k is None:
     sys.exit(f"{words_rel} has no words after {kept['id']} starts ({kept['start']}s): check that it belongs to this "
              f"shots.json, or pick the first shot to keep with --from.")
-if k > 0 and not ends_sentence(words[k - 1]["w"]):
+if a.line_audio and k > 0 and not ends_sentence(words[k - 1]["w"]):
     print(f'NOTE {kept["id"]} starts mid-sentence ("... {words[k - 1]["w"]} | {words[k]["w"]} ..."): the hook line runs '
           f"straight into it. Check that the two read well together, or keep from the shot where line 2 starts "
           f"(--from).")
@@ -258,12 +264,17 @@ if line is not None and not norm(line):
     sys.exit(f'{"--line" if a.line is not None else f"inputs/hook_{L}.txt"} has no words in it: give the hook line as '
              'it is spoken, e.g. --line "Three a.m. again?"')
 line_path = os.path.join(P, a.line_audio) if os.path.exists(os.path.join(P, a.line_audio)) else a.line_audio
+make_take = (f"write the line to inputs/hook_{L}.txt and make it with the main voiceover's voice and settings: python3 "
+             f"$S/generate.py voice --text-file inputs/hook_{L}.txt --out audio/{hook}_line.mp3 (the voice saved with "
+             f"check_setup.py --voice-id, or --voice <id>)")
 if not os.path.isfile(line_path):
-    sys.exit(f"No hook line take at {a.line_audio}. Make it with the main voiceover's voice first: python3 "
-             f"$S/generate.py voice --text-file inputs/hook_{L}.txt --out audio/{hook}_line.mp3 --voice <its voice id>")
+    sys.exit(f"No hook line take at {a.line_audio}. First {make_take}.")
 if os.path.abspath(line_path) in (os.path.abspath(vo), os.path.abspath(os.path.join(P, vo_out))):
     sys.exit(f"--line-audio is {a.line_audio}: give the hook line take on its own (e.g. audio/{hook}_line.mp3), not "
              "a full voiceover.")
+if " Audio: " not in subprocess.run([ffmpeg(), "-hide_banner", "-i", line_path], capture_output=True, text=True,
+                                    encoding="utf-8", errors="replace").stderr:
+    sys.exit(f"{a.line_audio} has no sound in it (or isn't an audio file). Check the file, or {make_take}.")
 m = re.search(r"Audio:.*?(\d+) Hz", probe)
 rate = int(m.group(1)) if m else 44100
 main = load_audio(vo, rate)
@@ -383,15 +394,21 @@ cmd += (["--language", lang] if lang else []) + (["--trust-script"] if a.trust_s
 print(f"timing {vo_out} (transcribe.py):")
 sys.stdout.flush()
 if subprocess.run(cmd).returncode:
-    sys.exit(f"transcribe.py stopped (its message is above), so {plan_rel} wasn't written. {vo_out} and {script_rel} "
-             "are there to listen to and read: fix the cause, then run hook.py again"
+    sys.exit(f"transcribe.py stopped (its message is above), so {plan_rel} wasn't written. Listen to {vo_out} and read "
+             f"{script_rel}: if the take doesn't say \"{line}\", give the right words (--line) or make the take again; "
+             f"if the voiceover isn't in {lang or 'English'}, pass --language. Then run hook.py again"
              + (" with --force." if os.path.exists(plan_path) else "."))
 
 # The join, heard: a word clipped there is heard differently (or not at all). The timing needs no check: the
 # kept part of the voiceover moved by exactly delta. (transcribe.py above already listed the line's own words.)
 new_words = [w for w in load_json(os.path.join(P, words_out)) if isinstance(w, dict) and number(w.get("s"))]
-odd = [w for w in new_words if "heard" in w and norm(w["heard"]) != norm(w.get("w", "")) and abs(w["s"] - join_t) <= 1]
-if not any(norm(w.get("w", "")) == norm(words[k]["w"]) and abs(w["s"] - (ks + delta)) < 1 for w in new_words):
+# Only the main voiceover is cut, so only its first words after the join can be clipped; a word heard there the
+# same way as in the main take (a brand name Whisper always mishears) or put in from the script ("heard": "") is fine.
+main_pairs = {(norm(x.get("w", "")), norm(x.get("heard", x.get("w", "")))) for x in words}
+odd = [w for w in new_words if cut > 0 and "heard" in w and w["heard"] != ""
+       and norm(w["heard"]) != norm(w.get("w", "")) and join_t - 0.05 <= w["s"] <= join_t + 1
+       and (norm(w.get("w", "")), norm(w["heard"])) not in main_pairs]
+if cut > 0 and not any(norm(w.get("w", "")) == norm(words[k]["w"]) and abs(w["s"] - (ks + delta)) < 1 for w in new_words):
     odd.append({"s": ks + delta, "heard": "nothing", "w": words[k]["w"]})
 if any(w.get("heard") == w.get("w") for w in new_words):
     print(f"(hook.py ran transcribe.py for you: fix those words in {words_out} by hand, or, when the hook line take "

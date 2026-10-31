@@ -23,7 +23,7 @@ import subprocess
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from common import CLIP_TYPES, H, W, clip_path, duration, ffmpeg, find_font, run_ffmpeg
+from common import CLIP_TYPES, H, W, clip_path, duration, ffmpeg, ffmpeg_fix, find_font, run_ffmpeg, sentence_end
 
 ap = argparse.ArgumentParser()
 ap.add_argument("project")
@@ -31,6 +31,8 @@ ap.add_argument("--shots", default="shots.json")
 ap.add_argument("--out")
 ap.add_argument("--no-captions", action="store_true")
 ap.add_argument("--preview", action="store_true")
+ap.add_argument("--allow-unchecked", action="store_true",
+                help="cut the final even with words still as Whisper heard them (CHECK BY HAND lines not fixed)")
 a = ap.parse_args()
 
 P = os.path.abspath(a.project)
@@ -63,6 +65,12 @@ def has_sound(path):
     r = subprocess.run([ffmpeg(), "-hide_banner", "-i", path], capture_output=True, text=True,
                        encoding="utf-8", errors="replace")
     return " Audio: " in r.stderr
+
+
+def is_hdr(path):
+    r = subprocess.run([ffmpeg(), "-hide_banner", "-i", path], capture_output=True, text=True,
+                       encoding="utf-8", errors="replace")
+    return "arib-std-b67" in r.stderr or "smpte2084" in r.stderr
 
 
 data = load_json(os.path.join(P, a.shots), "Fix that line (a missing comma, quote or bracket) and run again.")
@@ -107,6 +115,7 @@ words_path = os.path.join(P, words_rel)
 # ---------- 0. check the plan before any work: every problem at once, each naming its shot ----------
 KINDS = CLIP_TYPES + ("image", "text", "avatar", "library", "footage")
 problems, ids = [], set()
+hdr_seen, hdr_notes = set(), []
 
 
 def need_file(what, path, sound=False):
@@ -165,6 +174,12 @@ for i, s in enumerate(shots):
         problems.append(f'{sid}: a {kind} shot needs "source" (the video file)')
     else:
         need_file(f"{sid}: video", clip_path(P, s), sound=bool(s.get("use_clip_audio")))
+    src = clip_path(P, s) if kind not in ("image", "text") else None
+    if src and os.path.isfile(src) and src not in hdr_seen:
+        hdr_seen.add(src)
+        if is_hdr(src):      # a phone's HDR (HLG/PQ) clip looks flat and washed out in an SDR ad
+            hdr_notes.append(f"{sid}: {rel(src)} is an HDR clip: it will look flat next to the others. Convert it "
+                             f"to SDR first (library.py index prints the command) and point the shot at that copy.")
 music = data.get("music")
 if music:
     if not isinstance(music, dict) or not music.get("file"):
@@ -195,7 +210,11 @@ def timing_cmd():
 
     def q(x):       # a path with a space in it, quoted for the shell
         return f'"{x}"' if " " in x and not x.startswith("<") else x
-    return f"python3 $S/transcribe.py {q(data['vo'])} . --script {q(script)} --words-out {q(words_rel)} --no-draft{lang}"
+    # A hook's own voiceover is always timed into the hook's own words file, never over the main ad's words.json.
+    target = f"words_{hook}.json" if is_hook and words_rel == "words.json" else words_rel
+    also = f'  (then set "words": "{target}" in {a.shots})' if target != words_rel or not data.get("words") and is_hook else ""
+    return (f"python3 $S/transcribe.py {q(data['vo'])} . --script {q(script)} --words-out {q(target)} --no-draft{lang}"
+            + also)
 
 
 def load_words(path):
@@ -214,7 +233,7 @@ def load_words(path):
     return out
 
 
-notes = []                  # things to look at before showing the ad, repeated after "saved"
+notes = list(hdr_notes)     # things to look at before showing the ad, repeated after "saved"
 words = None
 if vo and captions_on and not os.path.exists(words_path):
     # Without them the captions would be Whisper's guess at the mixed sound: brand names misspelled on screen.
@@ -226,12 +245,28 @@ if vo and os.path.exists(words_path):
     last = words[-1]["e"] if words else 0.0
     if not words:
         notes.append(f"{words_rel} has no words, so there are no captions. Time the voiceover again: {timing_cmd()}")
+    elif last > vo_len + 0.5 and captions_on:
+        # Words past the end of the voiceover can only come from another (longer) take: every caption would be wrong.
+        sys.exit(f"{words_rel} ends at {last:.1f}s but the voiceover is only {vo_len:.1f}s long: it was made from "
+                 f"another take, so the captions would be wrong. Time it again:\n  {timing_cmd()}")
     elif last > vo_len + 0.5 or vo_len - last > 2.0:
         notes.append(f"WARNING {words_rel} ends at {last:.1f}s but the voiceover is {vo_len:.1f}s long: it was made "
                      f"from another take, so the captions would be out of sync. Time it again: {timing_cmd()}")
     elif os.path.getmtime(words_path) < os.path.getmtime(vo) - 1:
         notes.append(f"{data['vo']} changed after {words_rel} was made. If it's a new take, time it again "
                      f"({timing_cmd()}) or the captions drift.")
+    unsure = [x for x in words if x.get("heard") is not None and x["heard"] == x["w"]]
+    if unsure and captions_on:
+        # Words transcribe.py couldn't match to the script are still Whisper's guess (a brand name misspelled).
+        listed = ", ".join(f'{x["s"]:.1f}s "{x["w"]}"' for x in unsure[:8]) + (" ..." if len(unsure) > 8 else "")
+        fix = (f'Fix each "w" in {words_rel} to the script\'s word (keep "heard"), or delete its "heard" if the '
+               f"voiceover really says that, or time it again with --trust-script.")
+        if a.preview or a.allow_unchecked:
+            notes.append(f"{len(unsure)} caption word(s) are still as Whisper heard them: {listed}. {fix}")
+        else:
+            sys.exit(f"{len(unsure)} word(s) in {words_rel} are still as Whisper heard them, so the captions would "
+                     f"show them that way: {listed}.\n{fix}\n(A --preview shows them anyway; --allow-unchecked "
+                     f"cuts the final as it is.)")
 if a.out:
     out = os.path.join(P, a.out)
 elif a.preview:
@@ -248,7 +283,9 @@ os.makedirs(os.path.dirname(out), exist_ok=True)
 w, h = (540, 960) if a.preview else (W, H)
 FPS = 30
 enc = ["-c:v", "libx264", "-preset", "ultrafast" if a.preview else "medium", "-crf", "18",
-       "-pix_fmt", "yuv420p", "-r", str(FPS), "-an"]
+       "-pix_fmt", "yuv420p", "-r", str(FPS), "-an",
+       # tagged SDR, so the joined ad doesn't take an HDR library clip's tags and look wrong in players
+       "-color_primaries", "bt709", "-color_trc", "bt709", "-colorspace", "bt709"]
 fill = f"scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},setsar=1,fps={FPS}"
 
 # Shots are joined in list order, so each must start where the one before ends (the first at 0),
@@ -500,8 +537,8 @@ if not vo:
         with open(heard_from, encoding="utf-8") as f:
             stale = f.read() != heard
 if not vo and clip_audio and (stale or not os.path.exists(words_path)):
-    # No word timings yet, or the clips' voices changed: transcribe the finished sound. Captions or not:
-    # verify_vo.py and qc.py check the ad against these words too.
+    # No word timings yet, or the clips' voices changed: transcribe the finished sound. Captions or not: qc.py
+    # uses them to tell a closing hold after the last word (verify_vo.py checks each talking shot's "text").
     if stale:
         print(f"  the clips' voices changed since {words_rel} was made: transcribing them again")
     r = subprocess.run([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "transcribe.py"),
@@ -602,7 +639,7 @@ if captions_on and has_speech and words:
     for i, wd in enumerate(words):
         cur.append(wd)
         gap = words[i + 1]["s"] - wd["e"] if i + 1 < len(words) else 9
-        if mark(wd) in PUNCT or gap > 0.35:
+        if mark(wd) in PUNCT and (mark(wd) != "." or sentence_end(wd["w"])) or gap > 0.35:   # "a.m." isn't an end
             clauses.append(cur)
             cur = []
     if cur:
@@ -640,7 +677,8 @@ if captions_on and has_speech and words:
         over = [s for s in shots if s["start"] < t1 and s["end"] > t0]      # shots it is on screen over
         first = next((s for s in over if s["start"] <= t0 < s["end"]), over[0] if over else {})
         talking = first.get("type") in ("avatar", "talking") or first.get("use_clip_audio")
-        p = first.get("caption_pos", "low" if talking else cap.get("position", "middle"))
+        own = cap.get("position") if isinstance(user_cap, dict) and "position" in user_cap else None
+        p = first.get("caption_pos", own if own is not None else "low" if talking else cap.get("position", "middle"))
         want = h * min(max(p if number(p) else ypos.get(p, 0.5), 0.35), 0.8)
         half = len(lines) * fsize / 2 + outline
         boxes = [(s, b) for s in over for b in [card_box(s)] if b]
@@ -737,7 +775,8 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     r = subprocess.run([ffmpeg(), "-hide_banner", "-loglevel", "error", "-y", "-i", video, "-vf", vf]
                        + final_enc + [pic], cwd=tmp, capture_output=True, text=True, encoding="utf-8", errors="replace")
     if r.returncode != 0:
-        sys.exit("ffmpeg failed (captions):\n" + r.stderr[-2000:])
+        hint = "\n" + ffmpeg_fix() if "No such filter" in r.stderr or "Unknown encoder" in r.stderr else ""
+        sys.exit("ffmpeg failed (captions):\n" + r.stderr[-2000:] + hint)
 
 # ---------- 4. join picture and sound (picture copied, sound encoded once) ----------
 run_ffmpeg(["-i", pic, "-i", snd, "-map", "0:v", "-map", "1:a", "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",

@@ -10,11 +10,11 @@ Paste a script. Claude plans every shot, makes the characters, images, clips and
 
 - **A finished 9:16 ad**, cut frame-accurately to the voiceover, with captions, music and an end card
 - **Your clips, AI clips, or both**: make every shot with AI, cut the ad from your own clip library, or mix them (library first, AI fills the gaps). Library-only edits cost nothing to make
-- **Hook variants**: write your own hook lines or pick from suggestions. Each one is cut onto the same ad
+- **Hook variants**: write your own hook lines or pick from suggestions. Each new line is joined onto the same voiceover in the pause before line 2 (the main voiceover is never changed), and the rest of the ad's clips are reused, re-timed to match
 - **Every size**: 9:16, 4:5, 1:1 and 16:9 from the same edit
 - **The same character in every shot**: one master character sheet, with every other version edited from it
 - **Any kind of voiceover**: your own file, a generated voice, characters talking on screen, an AI presenter, or text on screen with no voice
-- **Checks before delivery**: the voiceover is matched word for word, plus frozen frames, black frames, sizes, file specs and your platform's length and file-size limits
+- **Checks before delivery**: the voiceover is matched word for word and the captions checked against it, talking characters' lines are checked shot by shot against the script, plus clips that freeze, black frames, sizes made from an old cut, file specs and your platform's length and file-size limits
 - **Easy revisions**: every draft comes with a shot map (time, shot and line for each shot). Give notes by time, line or description. Claude sorts them into free edits and paid remakes, shows the cost before changing anything, and sends v2 with a list of what changed
 - **Music that sits under the voice**: your track dips automatically while someone speaks, and you can switch to a second track at any line
 
@@ -42,7 +42,7 @@ Paste a script. Claude plans every shot, makes the characters, images, clips and
 
 ## Built for Kie.ai, also works with Replicate and Higgsfield
 
-This skill is built for [Kie.ai](https://kie.ai) and tested on it. One Kie key and one balance cover the images, video clips, voiceovers (a fixed list of ElevenLabs voices), lip-sync and talking avatars. To use your own ElevenLabs voices, add an [ElevenLabs](https://elevenlabs.io) key too.
+This skill is built for [Kie.ai](https://kie.ai) and tested on it. One Kie key and one balance cover the images, video clips, voiceovers (a fixed list of ElevenLabs voices), music, lip-sync and talking avatars. To use your own ElevenLabs voices, add an [ElevenLabs](https://elevenlabs.io) key too.
 
 **Two more ready-made options**, picked at setup. You can mix them: each job (images, video, voice, music, lip-sync) can use a different one.
 
@@ -94,13 +94,16 @@ and paste your brief. The must-haves are your script, the product (name, what it
 
 ## What it costs
 
-You pay your AI tools directly. The skill itself is free. Rough prices on Kie.ai:
+You pay your AI tools directly. The skill itself is free. Prices on Kie.ai (draft / standard / best; from kie.ai/pricing, checked October 2026):
 
 | Item | Approx |
 |---|---|
-| Image (character sheet, start frame) | $0.05 to $0.09 |
-| 8-second video clip (Veo 3.1 Fast) | $0.33 |
-| Lip-sync a talking shot | $0.16 |
+| Image (character sheet, start frame) | $0.02 / $0.06 / $0.09 (Nano Banana / Nano Banana 2 / Pro) |
+| Video clip, up to 8 seconds (Veo 3.1 Lite / Fast / Full) | $0.175 / $0.325 / $1.275 |
+| Voiceover | $0.07 per 1,000 characters (about $0.03 for a 30-second script) |
+| Lip-sync a talking shot | $0.04 per second of the line ($0.16 for a 4-second line) |
+| Talking avatar, per second of talking | $0.06 (InfiniteTalk, up to 15s of audio) / $0.04 / $0.08 (Kling, up to 5 minutes) |
+| Music track (Suno, 2 takes) | $0.06 |
 | A 30-second ad (about 10 clips) | about $4 |
 | A 60-second ad with 3 hooks | about $8 to $10 |
 
@@ -115,7 +118,9 @@ On Replicate and Higgsfield, video is billed per second, so asking for each shot
 | Voiceover, 60 seconds | about $0.09 (ElevenLabs v3) | Higgsfield MCP only |
 | A 30-second ad (about 10 clips) | about $9, or about $5 with `--fit` | about $7, or about $4 with `--fit` |
 
-Claude shows the estimate before every paid run, and you can set a per-run spending limit.
+`python3 scripts/generate.py prices` prints the current price list for the providers you use (free; `--provider replicate` to compare).
+
+Claude shows the estimate before every paid run. You can also give each ad a budget (`check_setup.py --budget 15`, run inside the ad's folder): a run that would take the ad past it is blocked, and every paid run ends with what the ad has cost so far (`generate.py spend .` shows it any time, per job type). `check_setup.py --limit 5` caps any single run. If a run is cut off after the provider has taken a paid job (a timeout, a lost connection), running the same command again collects that job instead of paying for a new one.
 
 ## Requirements
 
@@ -135,10 +140,11 @@ The first time it times a voiceover, it downloads a small speech model. That tak
 | `requirements.txt` | The Python packages to install |
 | `house-rules-template.md` | Optional: how you or your team work, followed on every ad |
 | `guides/phone-look-guide.md` | How to make AI frames look like real phone footage |
-| `scripts/check_setup.py` | Finds your tools and keys, and saves which tool does which job (free) |
-| `scripts/generate.py` | One command for every image, clip, voiceover, lip-sync, avatar and music track |
+| `scripts/check_setup.py` | Finds your tools and keys, saves which tool does which job, and sets spending limits (free) |
+| `scripts/generate.py` | One command for every image, clip, voiceover, lip-sync, avatar and music track; also the price list and what each ad has cost |
 | `scripts/providers/` | One small file per AI service |
 | `scripts/transcribe.py` | Word timings and a first draft of the shots |
+| `scripts/hook.py` | A hook variant: joins a new opening line onto the voiceover and re-times the rest of the plan |
 | `scripts/edit.py` | Cuts the ad: shots on the voiceover, captions, music, end card |
 | `scripts/library.py` | Indexes your clip library, finds clips for each line, and tracks which were used |
 | `scripts/contact_sheet.py` | Frames from every clip on one page, for checking |
@@ -166,6 +172,10 @@ Copy `scripts/providers/kie.py` (or `replicate.py` / `higgsfield.py`), set `name
 **How do I give notes on a draft?** Use the shot map that comes with it: say the time, the line or just describe the shot. Changes to cuts, captions and music are free; anything that needs a new image or clip shows its cost first.
 
 **What if my credits run out halfway?** It stops and tells you. It can finish the edit with still images for the missing shots and lists them, so you always get a complete ad.
+
+**What if a run gets cut off?** Run it again. A paid job the provider already took is collected, not paid for twice (Kie keeps jobs 14 days, Higgsfield about 7, Replicate only an hour).
+
+**Can I cap what an ad costs?** Yes. Tell Claude your budget at the start: every run shows what the ad has cost so far, and a run that would go over it is blocked until you say so.
 
 ## License
 

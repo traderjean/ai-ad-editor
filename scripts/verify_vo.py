@@ -114,16 +114,16 @@ def load_plan(rel, data):
                                               if s.get("type") == "avatar" and s.get("source")), None)  # video is the VO
     words_rel = a.words or data.get("words")
     hook = re.match(r"shots_(hook.*)\.json$", os.path.basename(rel))
-    if not words_rel and hook:          # as edit.py: a hook with its own voiceover has its own words file
-        own = f"words_{hook.group(1)}.json"
-        try:
-            with open(os.path.join(a.project, "shots.json"), encoding="utf-8") as f:
-                main_vo = json.load(f).get("vo")
-        except (OSError, ValueError, AttributeError):
-            main_vo = None
-        if os.path.exists(os.path.join(a.project, own)) or not vo_rel or \
-                os.path.normpath(vo_rel) != os.path.normpath(str(main_vo or "")):
-            words_rel = own
+    own = f"words_{hook.group(1)}.json" if hook else None
+    try:
+        with open(os.path.join(a.project, "shots.json"), encoding="utf-8") as f:
+            main_vo = json.load(f).get("vo")
+    except (OSError, ValueError, AttributeError):
+        main_vo = None
+    # a hook with its own voiceover is timed into its own words file (as edit.py and hook.py do)
+    own_vo = bool(hook) and (not vo_rel or os.path.normpath(vo_rel) != os.path.normpath(str(main_vo or "")))
+    if not words_rel and hook and (os.path.exists(os.path.join(a.project, own)) or own_vo):
+        words_rel = own
     words_rel = words_rel or "words.json"
     wp = os.path.join(a.project, words_rel)
     lang = (a.language or data.get("language") or "en").lower()
@@ -153,14 +153,16 @@ def load_plan(rel, data):
     vo = load_audio(vp, 8000)
     if len(vo) < 8000:
         return f"The voiceover {vp} has less than a second of sound."
-    m = re.match(r"words_(.+)\.json$", os.path.basename(words_rel))       # words_hookB.json <- script_hookB.txt
+    # The fix always times a hook's own voiceover into the hook's own words file, never over the main words.json.
+    target = own if own_vo else words_rel
+    m = re.match(r"words_(.+)\.json$", os.path.basename(target))          # words_hookB.json <- script_hookB.txt
     script = os.path.join(a.project, "inputs", f"script_{m.group(1)}.txt" if m else "script.txt")
     redo = (f"python3 $S/transcribe.py {os.path.normpath(vp)} {a.project} --script "
             + (os.path.normpath(script) if os.path.exists(script) else "<its script>")
             + (f" --language {lang}" if lang != "en" else "")
-            + (f" --words-out {words_rel} --no-draft" if words_rel != "words.json" else ""))
-    if not a.words and not data.get("words") and words_rel != "words.json":
-        redo += f', and add "words": "{words_rel}" to {rel}'
+            + (f" --words-out {target} --no-draft" if target != "words.json" else ""))
+    if not a.words and data.get("words") != target and target != "words.json":
+        redo += f', and set "words": "{target}" in {rel}'
     if not os.path.exists(wp):
         return f"No word timings at {wp}: time the voiceover first ({redo}), then run edit.py again."
     try:
@@ -294,8 +296,24 @@ def check_lines(plan, got):
     ok, out = True, []
     for n, s in enumerate(talk):
         idx = [k for k, w in enumerate(want) if w[2] == n]
+        here = [g for g in got if s["start"] - 0.5 <= g[1] <= s["end"] + 0.5]
         if not idx:
+            if here:            # it talks, but there's no line to check it against
+                ok = False
+                out.append(f"{s.get('id', '?')} ({s['start']:.1f}-{s['end']:.1f}s): speech heard (\""
+                           + " ".join(g[2] for g in here[:10]) + "\") but it has no line in \"text\": write its "
+                           "spoken line there so it can be checked, then run this again.")
             continue
+        # The match above is one pass over the whole ad, so a missing line next door can pull this shot's words
+        # out of place: match the line again against only what's heard inside this shot's own slot.
+        mine, near_here = [want[k][0] for k in idx], [g[0] for g in here]
+        for kind, i1, i2, j1, j2 in difflib.SequenceMatcher(None, mine, near_here, autojunk=False).get_opcodes():
+            if kind == "equal" or kind == "replace" and (i2 - i1 == j2 - j1 and all(
+                    difflib.SequenceMatcher(None, mine[i1 + q], near_here[j1 + q]).ratio() >= 0.75
+                    for q in range(i2 - i1)) or difflib.SequenceMatcher(
+                    None, "".join(mine[i1:i2]), "".join(near_here[j1:j2])).ratio() >= 0.8):
+                for q in range(i1, i2):
+                    inplace[idx[q]] = True
         runs, run = [], []
         for k in idx:
             if not inplace[k]:
@@ -372,7 +390,14 @@ for path in finals:
         vo_missing = align(plan, plan["heard"])[1]
         if any(j2 > j1 for _, _, j1, j2 in vo_missing) or sum(i2 - i1 for i1, i2, _, _ in vo_missing) >= 2:
             stale = vo_missing
-    ok = not werr and not sync and not stale
+    # A words file from a shorter take (lines added since, or a cut-off timing run) lines up perfectly as far as it
+    # goes: catch the voiceover still talking after its last word (the voice-only file, so music can't do it).
+    last = max(float(w.get("e", w["s"])) for w in ref)
+    vo = plan["vo"]
+    tail = [t for t in np.arange(last + 0.5, len(vo) / 8000 - 0.5, 0.5)
+            if np.abs(vo[int(t * 8000):int(t * 8000) + 4000]).max() >= 300 / 32768]
+    longer = len(tail) >= 3
+    ok = not werr and not sync and not stale and not longer
     bad += not ok
     wave = "identical to the voiceover" if not werr else "MISMATCH"
     print(f"{'PASS' if ok else 'FAIL'}  {name}: {matched}/{len(tok)} words in place, waveform {wave}{tag}")
@@ -391,7 +416,10 @@ for path in finals:
               (f"the voiceover says \"{says}\"" if says else "the voiceover doesn't say it"))
     if len(stale) > 6:
         print(f"      ... and {len(stale) - 6} more places")
-    if sync or stale:
+    if longer:
+        print(f"      the voiceover goes on talking after {plan['words']} ends at {last:.1f}s (sound at "
+              f"{tail[0]:.1f}s and later): it was timed from a shorter take, so the end has no captions")
+    if sync or stale or longer:
         print(f"      The captions come from {plan['words']}: time this voiceover again ({plan['redo']}), "
               "then run edit.py again.")
     for i1, i2, _, _ in ([] if stale else missing):

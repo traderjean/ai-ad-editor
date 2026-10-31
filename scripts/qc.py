@@ -10,7 +10,7 @@ For the newest take of each file in final/ (previews and older _v<n> takes skipp
     start); stills, text cards and the end card may hold still, and so may a shot with "freeze_ok": true
   - sizes (4x5 / 1x1 / 16x9) made from the newest 9:16, not from an older take of it
   - length within the platform's ad limit, file size under its upload limit
-  - the voiceover check (verify_vo.py) on 9:16 files when the ad speaks (a voiceover, an avatar, clip voices)
+  - the voiceover check (verify_vo.py) on every 9:16 file, with its notes
 The platform is --platform, else "platform" in shots.json, else meta.
 Writes qc/report.md and exits 1 if anything fails.
 """
@@ -281,8 +281,7 @@ for path in files:
         problems.append(f"sound is {snd:.1f}s, file is {length:.1f}s")
     if abs(pic - length) > 0.3:
         problems.append(f"picture is {pic:.1f}s, file is {length:.1f}s")
-    speaks = plan.get("vo") or any(s.get("use_clip_audio") or s.get("type") == "avatar" for s in plan.get("shots", []))
-    if shape == "9x16" and speaks:
+    if shape == "9x16":     # every 9:16 file: a plan with no speech passes fast, a stray words file is caught
         # absolute paths: verify_vo reads a relative file from the project folder, which would join it twice
         r = subprocess.run([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "verify_vo.py"),
                             os.path.abspath(a.project), os.path.abspath(path), "--shots", rel],
@@ -293,6 +292,7 @@ for path in files:
             problems.append("voiceover check: " + " | ".join(line))
         else:
             notes.append("voiceover check: " + line[0])
+            notes += [x.strip() for x in line[1:] if x.strip()]      # its notes: unsure words, a changed word
     ok = not problems
     failed += not ok
     report.append(f"## {'PASS' if ok else 'FAIL'}  {name}")

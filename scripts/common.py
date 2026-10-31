@@ -111,6 +111,20 @@ def duration(path):
     return int(h) * 3600 + int(mi) * 60 + float(se)
 
 
+ABBREVIATIONS = {"a.m.", "p.m.", "dr.", "mr.", "mrs.", "ms.", "st.", "vs.", "etc.", "e.g.", "i.e.", "no.", "approx.",
+                 "mme.", "mlle.", "env.", "p.ex."}
+
+
+def sentence_end(word):
+    """True when a word ends a sentence: "?", "!" or "…", or a full stop that isn't an abbreviation ("a.m.", "Dr.",
+    "M.", "U.S."). Closing quotes and brackets are looked past ("encore ?»")."""
+    w = str(word).rstrip("\"'”’»)]").rstrip()
+    if w.endswith(("?", "!", "…")):
+        return True
+    return w.endswith(".") and w.lower() not in ABBREVIATIONS and not re.search(r"\w\.\w", w) \
+        and not re.fullmatch(r"\w\.", w)
+
+
 def load_audio(path, rate=16000):
     """Mono float32 samples for faster-whisper, decoded with our own ffmpeg. Passing a file path makes
     faster-whisper decode with PyAV, whose newer releases break it ("unexpected keyword 'metadata_errors'")."""
@@ -265,7 +279,7 @@ def check_spend(estimate, project=None):
     done, unknown = spent(project)
     now = estimate or 0
     also = f" ({unknown} earlier run(s) of unknown cost aren't counted)" if unknown else ""
-    if done + now > budget + 1e-9:
+    if now > 0 and done + now > budget + 1e-9:      # collecting an already-paid job ($0) always goes through
         sys.exit(f"BLOCKED: this ad has spent ${done:.2f} and this run (~${now:.2f}) would take it to "
                  f"${done + now:.2f}, over its ${budget:.2f} budget{also}. Ask the user: raise it with "
                  f"check_setup.py --budget <usd> (run inside the project), or make less.")

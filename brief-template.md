@@ -1,6 +1,6 @@
 # Ad brief
 
-Fill this in and paste it to Claude with "Edit this ad". Every clip in the ad is AI-generated. The must-haves are required. Leave any optional line blank and the default is used.
+Fill this in and paste it to Claude with "Edit this ad". The must-haves are required. Leave any optional line blank and the default is used. Anything you answer here, Claude won't ask again.
 
 ## MUST-HAVE
 
@@ -22,8 +22,12 @@ Fill this in and paste it to Claude with "Edit this ad". Every clip in the ad is
 
 | Field | Options | Default |
 |---|---|---|
+| Clips | AI-generated / my own clip library (give the folder) / mixed: my library first, AI for the gaps | AI-generated |
+| Language of the script | English, French, ... | English |
+| How hands-on, and budget per ad | approve every step / key steps only (brief, shot plan, final) / autopilot; and the most this ad may cost, e.g. $15 | Claude asks once (and can save it to your house rules) |
 | Hooks | how many, and your hook lines if you have them | 1 hook: the script's first line |
 | Look | anything: 3D animated, 2D cartoon, motion graphics, cinematic, photoreal phone footage, your own reference | you choose in Step 2 |
+| Music | your track / two tracks switching at a line / make one for this ad / none | Claude asks before the edit |
 | Main character | age, look, job | 3 options suggested from the buyer |
 | Their day | 2 or 3 real moments from their life, and who's around them | I suggest some |
 | Explanation lines | simple 3D animation / visual metaphor / lifestyle only | simple 3D animation |

@@ -25,7 +25,7 @@ import sys
 import unicodedata
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from common import load_audio, load_settings
+from common import load_audio, load_settings, sentence_end
 
 ap = argparse.ArgumentParser()
 ap.add_argument("vo")
@@ -203,7 +203,7 @@ for w in words:
     if cur and w["e"] - cur[0]["s"] > max_shot:
         cut = len(cur)
         for j in range(len(cur) - 1, 0, -1):     # back up to the last sentence/comma/pause
-            if cur[j - 1]["w"][-1] in ".?!,;:" or cur[j]["s"] - cur[j - 1]["e"] > 0.25:
+            if cur[j - 1]["w"][-1] in ",;:" or sentence_end(cur[j - 1]["w"]) or cur[j]["s"] - cur[j - 1]["e"] > 0.25:
                 cut = j
                 break
         rest = cur[cut:]
@@ -211,7 +211,7 @@ for w in words:
         flush()
         cur = rest
     cur.append(w)
-    if w["w"][-1] in ".?!" and w["e"] - cur[0]["s"] > 2.5:
+    if sentence_end(w["w"]) and w["e"] - cur[0]["s"] > 2.5:
         flush()
         cur = []
 flush()

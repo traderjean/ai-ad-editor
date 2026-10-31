@@ -10,9 +10,9 @@
 
 The index lives in <folder>/_index/index.json and is updated, never rebuilt: new clips are added,
 tags you wrote are kept. Clips in subfolders are indexed too, named by their path ("2024/walk.mp4").
-Frames are in <folder>/_index/frames/. Files that can't be read (empty, still copying, no picture)
-are skipped and listed; index again once they're fixed. HDR phone clips (HLG/PQ) are flagged: their
-colours look flat in the ad unless converted first (index prints the command).
+Frames are in <folder>/_index/frames/ (index makes deleted ones again). Files that can't be read (empty,
+still copying, no picture) are skipped and listed; index again once they're fixed. HDR phone clips
+(HLG/PQ) are flagged: their colours look flat in the ad unless converted first (index prints the command).
 """
 import argparse
 import datetime
@@ -39,6 +39,17 @@ def load(folder):
     if os.path.exists(ip):     # a broken one stops with its line, never a traceback
         data = load_json(ip, "Fix that line and run this again (don't delete the file: the tags in it are your work).")
         if isinstance(data, dict) and isinstance(data.get("clips"), dict):
+            for n, c in data["clips"].items():      # a hand-edited entry: fill in what's missing, never a KeyError
+                if not isinstance(c, dict):
+                    sys.exit(f'{ip}: the entry for {n} isn\'t {{...}}. Fix it (or delete that entry and index again).')
+                if not isinstance(c.get("tags"), str):
+                    c["tags"] = ""
+                if not isinstance(c.get("used_in"), list):
+                    c["used_in"] = []
+                c["used_in"] = [u for u in c["used_in"] if isinstance(u, dict)]
+                c.setdefault("seconds", 0)
+                c.setdefault("shape", "?")
+                c.setdefault("frames", [])
             return data
         sys.exit(f'{ip} isn\'t a library index (it should hold {{"clips": {{...}}}}). Move it away and index again.')
     return {"clips": {}}
@@ -92,6 +103,24 @@ def video_files(folder):
     return sorted(found)
 
 
+def make_frames(folder, f, d):
+    """4 frames of a clip, at 1/8, 3/8, 5/8 and 7/8 of it."""
+    _, _, fr = paths(folder)
+    frames = []
+    for k in range(4):
+        t = d * (k + 0.5) / 4
+        # full name: clip.mov and clip.mp4 don't share frames; a subfolder's "/" can't be in a file name
+        out = os.path.join(fr, f"{f.replace('/', '__')}_{k + 1}.jpg")
+        run_ffmpeg(["-ss", f"{t:.2f}", "-i", os.path.join(folder, f), "-frames:v", "1", "-vf", "scale=-2:320", out])
+        frames.append({"t": round(t, 2), "file": os.path.relpath(out, folder)})
+    return frames
+
+
+def frames_missing(folder, c):
+    return not isinstance(c["frames"], list) or not c["frames"] or any(
+        not isinstance(x, dict) or not os.path.isfile(os.path.join(folder, str(x.get("file", "")))) for x in c["frames"])
+
+
 def cmd_index(a):
     if not os.path.isdir(a.folder):
         sys.exit(f"{a.folder} isn't a folder. Give the library folder's full path.")
@@ -99,7 +128,7 @@ def cmd_index(a):
     _, _, fr = paths(a.folder)
     os.makedirs(fr, exist_ok=True)
     files = video_files(a.folder)
-    new, skipped, hdr = 0, [], []
+    new, skipped, hdr, remade = 0, [], [], 0
     try:
         for f in files:
             if f in data["clips"]:
@@ -108,18 +137,18 @@ def cmd_index(a):
                     c["hdr"] = size_of(os.path.join(a.folder, f))[2]
                 if c["hdr"]:
                     hdr.append(f)
+                if frames_missing(a.folder, c):     # frames deleted: make them again, the tags stay
+                    try:
+                        c["frames"] = make_frames(a.folder, f, duration(os.path.join(a.folder, f)))
+                        remade += 1
+                    except SystemExit:
+                        skipped.append(f)
                 continue
             p = os.path.join(a.folder, f)
             try:        # duration() and run_ffmpeg() exit on a file they can't read: skip it, keep going
                 d = duration(p)
                 w, h, kind = size_of(p)
-                frames = []
-                for k in range(4):
-                    t = d * (k + 0.5) / 4
-                    # full name: clip.mov and clip.mp4 don't share frames; a subfolder's "/" can't be in a file name
-                    out = os.path.join(fr, f"{f.replace('/', '__')}_{k + 1}.jpg")
-                    run_ffmpeg(["-ss", f"{t:.2f}", "-i", p, "-frames:v", "1", "-vf", "scale=-2:320", out])
-                    frames.append({"t": round(t, 2), "file": os.path.relpath(out, a.folder)})
+                frames = make_frames(a.folder, f, d)
             except SystemExit:
                 skipped.append(f)
                 continue
@@ -149,6 +178,8 @@ def cmd_index(a):
                                     o=quote(os.path.join(a.folder, os.path.splitext(f)[0] + "_sdr.mp4"))))
     untagged = sum(1 for c in data["clips"].values() if not c["tags"])
     pages = (len(data["clips"]) + PER_PAGE - 1) // PER_PAGE
+    if remade:
+        print(f"  made the frames of {remade} clip(s) again (they were missing)")
     print(f"{len(data['clips'])} clips ({new} new, {len(gone)} removed, {len(skipped)} skipped). {untagged} still need "
           f"tags. Look at them with: library.py sheet <folder> --page 1..{pages}")
 
@@ -162,6 +193,10 @@ def cmd_sheet(a):
         sys.exit("No clips on that page.")
     font = load_font(20)
     rows = []
+    lost = [n for n in page if frames_missing(a.folder, data["clips"][n])]
+    if lost:        # deleted or never made: index makes them again, keeping the tags
+        sys.exit(f"The frames of {', '.join(lost)} are missing. Run library.py index {a.folder} (it makes them again "
+                 "and keeps the tags), then this.")
     for n in page:
         c = data["clips"][n]
         ims = [Image.open(os.path.join(a.folder, fr["file"])).convert("RGB") for fr in c["frames"]]
@@ -274,8 +309,10 @@ def cmd_find(a):
         hdr = f"  {hdr_label(c['hdr'])}" if c.get("hdr") else ""
         print(f"{sc:4.1f}  {n}  {c['seconds']}s  {c['tags'][:70]}{used}{hdr}")
     if left_out:
-        print(f"({left_out} matching clip(s) used in earlier ads left out: run without --avoid-used to see them)")
-    if not scored:
+        print(f"({left_out} matching clip(s) used in earlier ads left out: run without --avoid-used to see them)"
+              if scored else f"The only matches ({left_out}) were used in earlier ads: run without --avoid-used to "
+                             "see them, or treat this line as a gap.")
+    if not scored and not left_out:
         print("No match in names or tags. Tag more clips, or this line is a gap (mixed mode: make it with AI). "
               "To pick by eye, read every clip's tags with: library.py list <folder>")
 

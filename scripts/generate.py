@@ -17,7 +17,7 @@ Everything a run needs (key, prompts, frames, refs, files) is checked first: not
 `clips` and `images` skip files that already exist (--only remakes the named ones, --redo all of them); a remake
 keeps the old take as <name>_prev. A paid job an earlier run started but didn't collect is finished, not paid twice.
 Clips are --seconds long (default: the video slot's max_seconds, 8). `clips --fit` asks for each shot's own length
-plus up to a spare second instead, which costs less on providers that bill per second (Replicate, Higgsfield);
+plus a little spare instead, which costs less on providers that bill per second (Replicate, Higgsfield);
 Kie's Veo charges the same for any length (the edit trims each clip). `clips --shots shots_draft.json` prices a draft.
 With a budget for the ad (check_setup.py --budget, inside the project) a run that would pass it is blocked.
 
@@ -42,7 +42,9 @@ from common import (QUALITIES, SLOTS, SPEND_LOG, check_spend, duration, find_pro
                     load_settings, log_spend, mmss, project_name, spend_rows, spent, voiceover_file)
 
 CLIP_TYPES = ("clip", "veo", "talking")      # shot types that need a generated clip ("veo" = old name)
-FIT_MARGIN = 1.0                             # --fit: a spare second per clip for trims and small re-timings
+FIT_MARGIN = 1.0                             # --fit: up to a spare second per clip for trims and small re-timings
+FIT_PAD = 0.25                               # ... but for an adapter that rounds lengths up itself, only this much,
+                                             # so a 3.1s shot stays a 4s clip instead of stepping up to 6s
 # Error texts (providers/) that mean the job may exist and be paid for even though it failed here.
 MAYBE_PAID = ("Made, but the download failed", "may have started", "Lost track", "may still finish")
 # Error texts that can mean a safety filter turned the prompt down (Kie reports most of those as "task failed").
@@ -110,7 +112,16 @@ def length_for_tool(seconds):
 # ---------- checks before anything is paid ----------
 
 def pending(p, out):
-    """The paid job an earlier run started for `out` and didn't collect (Provider.pending), else None."""
+    """The paid job an earlier run started for `out` and didn't collect (Provider.pending), else None.
+    Stops when another provider left one there: making a new job would drop the paid one."""
+    try:
+        with open(out + ".job.json", encoding="utf-8") as f:
+            other = json.load(f).get("provider")
+    except (OSError, ValueError, AttributeError):
+        other = None
+    if p is not None and other and other != p.name:
+        sys.exit(f"{os.path.basename(out)} has an unfinished {other} job from an earlier run (it's paid for): "
+                 f"collect it with --provider {other}, or delete {out}.job.json to drop it, then run this again.")
     return p.pending(out) if p is not None and hasattr(p, "pending") else None
 
 
@@ -159,7 +170,8 @@ def confirm(items, yes, remakes=(), project=None, problems=()):
     if known:
         print(f"{len(items)} job(s), about ${total:.2f}" + (" (some costs unknown)" if len(known) < len(items) else ""))
     else:
-        print(f"{len(items)} job(s), cost unknown (the provider doesn't report prices)")
+        print(f"{len(items)} job(s), cost unknown: there's no price table for this model, so the per-run limit "
+              f"and the ad's budget can't count it (the real cost shows after the run when the provider reports it)")
     if yes:
         stop_on(problems)
     check_spend(total if known else None, project)
@@ -448,8 +460,8 @@ def cmd_clips(a):
             continue
         if a.only and s["id"] not in a.only:
             continue
-        if not a.only and not a.redo and os.path.exists(out_of(s)):
-            continue
+        if not draft and not a.only and not a.redo and os.path.exists(out_of(s)):
+            continue                   # (a draft is only priced, so every shot in it counts)
         todo.append(s)
     if not todo:
         print("Nothing to make: every clip already exists (use --only or --redo to make new takes).")
@@ -486,7 +498,7 @@ def cmd_clips(a):
         n, spare = length(s)
         if "margin" in inspect.signature(fn).parameters:
             return {"seconds": n, "margin": spare}
-        return {"seconds": n + spare}
+        return {"seconds": n + min(spare, FIT_PAD)}
 
     no_prompt = []
     for s in todo:
@@ -512,7 +524,7 @@ def cmd_clips(a):
             try:
                 handoff(mode, "video", cfg, out_of(s), s["video_prompt"],
                         [os.path.join(a.project, s["frame"])] if s.get("frame") else [],
-                        {"aspect ratio": "9:16", "length": length_for_tool(n + spare), **extra,
+                        {"aspect ratio": "9:16", "length": length_for_tool(n + min(spare, FIT_PAD)), **extra,
                          "sound": "on" if s.get("type") == "talking" else "off (mute it)"},
                         s.get("quality", default_q), model)
             except SystemExit:
@@ -569,7 +581,11 @@ def cmd_voice(a):
     job = pending(p, a.out)
     label = os.path.basename(a.out)
     est = p.estimate("voice", quality, model=model, chars=len(text)) if quality in QUALITIES else None
+    plan = None if job or not text or not p.has_key() else p.describe("voice", chars=len(text), model=model)
+    if plan:                           # ElevenLabs bills plan characters, not dollars: say what this uses
+        print(f"  {plan}")
     confirm([(finishing(label, job), 0.0) if job else (label, est)], a.yes, project=project, problems=[
+        f"not enough ElevenLabs characters left this month ({plan})" if plan and "NOT ENOUGH" in plan else None,
         key_problem(p), quality_problem(p, "voice", quality, model, "--quality"),
         None if text or job else f"{a.text_file} is empty: put the script in it",
         None if voice_id or job else "no voice chosen: list them with generate.py voices, then pass --voice <id> "
