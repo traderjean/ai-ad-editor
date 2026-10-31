@@ -1,4 +1,5 @@
 """Shared helpers: settings (providers.json), ffmpeg, durations, spend log."""
+import csv
 import datetime
 import json
 import os
@@ -30,7 +31,7 @@ DEFAULT_SETTINGS = {
 def load_settings():
     s = json.loads(json.dumps(DEFAULT_SETTINGS))
     if os.path.exists(SETTINGS):
-        with open(SETTINGS) as f:
+        with open(SETTINGS, encoding="utf-8") as f:
             saved = json.load(f)
         for k, v in saved.items():
             if isinstance(v, dict) and isinstance(s.get(k), dict):
@@ -41,7 +42,7 @@ def load_settings():
 
 
 def save_settings(s):
-    with open(SETTINGS, "w") as f:
+    with open(SETTINGS, "w", encoding="utf-8") as f:
         json.dump(s, f, indent=2)
         f.write("\n")
 
@@ -64,14 +65,16 @@ def run_ffmpeg(args):
     exe = ffmpeg()
     if not exe:
         sys.exit("ffmpeg not found. Install it (see check_setup.py) and try again.")
-    r = subprocess.run([exe, "-hide_banner", "-loglevel", "error", "-y"] + args, capture_output=True, text=True)
+    r = subprocess.run([exe, "-hide_banner", "-loglevel", "error", "-y"] + args, capture_output=True, text=True,
+                       encoding="utf-8", errors="replace")
     if r.returncode != 0:
         sys.exit("ffmpeg failed:\n" + r.stderr[-2000:])
 
 
 def duration(path):
     """Length of an audio or video file in seconds (no ffprobe needed)."""
-    r = subprocess.run([ffmpeg(), "-hide_banner", "-i", path], capture_output=True, text=True)
+    r = subprocess.run([ffmpeg(), "-hide_banner", "-i", path], capture_output=True, text=True,
+                       encoding="utf-8", errors="replace")
     m = re.search(r"Duration: (\d+):(\d+):([\d.]+)", r.stderr)
     if not m:
         sys.exit(f"Could not read the length of {path}")
@@ -91,7 +94,8 @@ def load_audio(path, rate=16000):
 
 
 def mmss(seconds):
-    return f"{int(seconds // 60)}:{int(round(seconds % 60)):02d}"
+    s = int(round(seconds))
+    return f"{s // 60}:{s % 60:02d}"
 
 
 # ---------- project files ----------
@@ -108,7 +112,10 @@ def clip_path(project, shot):
     if kind in CLIP_TYPES:
         return os.path.join(project, "clips", shot["id"] + ".mp4")
     if kind in ("avatar", "footage", "library"):   # "footage" = old name; "library" = a clip from the user's library
-        return os.path.join(project, shot["source"])
+        path = os.path.join(project, shot["source"])
+        if kind == "library" and not os.path.exists(path) and os.path.exists(shot["source"]):
+            return shot["source"]       # "<folder>/<clip>", the folder as given to library.py (from the working folder)
+        return path
     return None
 
 
@@ -160,7 +167,8 @@ def log_spend(what, amount, project=""):
     if amount is None:
         return
     new = not os.path.exists(SPEND_LOG)
-    with open(SPEND_LOG, "a") as f:
+    with open(SPEND_LOG, "a", newline="", encoding="utf-8") as f:
+        w = csv.writer(f, lineterminator="\n")     # quotes a field with a comma in it (a label, a project path)
         if new:
-            f.write("time,what,usd,project\n")
-        f.write(f"{datetime.datetime.now().isoformat(timespec='seconds')},{what},{amount:.3f},{project}\n")
+            w.writerow(["time", "what", "usd", "project"])
+        w.writerow([datetime.datetime.now().isoformat(timespec="seconds"), what, f"{amount:.3f}", project])

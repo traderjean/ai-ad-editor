@@ -2,8 +2,9 @@
 
     edit.py <project> [--shots shots.json] [--out final/x.mp4] [--no-captions] [--preview]
 
-Reads the shots file (see SKILL.md) and the word timings. Each shot fills exactly start -> end, so cuts
-land on the words. --preview renders fast at 540x960 to final/preview_<hook>.mp4. Otherwise the file is
+Reads the shots file (see SKILL.md) and the word timings. Shots must touch end to end; each one fills
+exactly start -> end, cut on the nearest frame, so cuts land on the words.
+--preview renders fast at 540x960 to final/preview_<hook>.mp4. Otherwise the file is
 final/<project>_<hook>_9x16_v<n>.mp4 with the next free version number.
 
 Shot types: clip / talking (generated clips), avatar (an AI talking-avatar video, kept in sync),
@@ -14,6 +15,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 
@@ -29,9 +31,24 @@ ap.add_argument("--preview", action="store_true")
 a = ap.parse_args()
 
 P = os.path.abspath(a.project)
-with open(os.path.join(P, a.shots)) as f:
+with open(os.path.join(P, a.shots), encoding="utf-8") as f:
     data = json.load(f)
 shots = data["shots"]
+
+
+def rel(path):
+    """A path as the user sees it (inside the project); a full path when it's on another drive."""
+    try:
+        return os.path.relpath(path, P)
+    except ValueError:
+        return path
+
+
+if not data.get("vo"):        # an AI avatar video is the voiceover as well as the picture (SKILL.md option 4)
+    talker = next((s for s in shots if s.get("type") == "avatar" and s.get("source")), None)
+    if talker:
+        data["vo"] = talker["source"]
+        print(f"  no \"vo\" in {a.shots}: using the avatar video's sound ({talker['source']}) as the voiceover")
 vo = os.path.join(P, data["vo"]) if data.get("vo") else None
 vo_len = duration(vo) if vo else 0.0
 m = re.match(r"shots_?(.*)\.json$", os.path.basename(a.shots))
@@ -55,6 +72,15 @@ enc = ["-c:v", "libx264", "-preset", "ultrafast" if a.preview else "medium", "-c
        "-pix_fmt", "yuv420p", "-r", str(FPS), "-an"]
 fill = f"scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},setsar=1,fps={FPS}"
 
+# Shots are joined in list order, so each must start where the one before ends (the first at 0),
+# or every later cut moves off its words.
+t = 0.0
+for s in shots:
+    if abs(s["start"] - t) > 0.001 or s["end"] <= s["start"]:
+        sys.exit(f"{s['id']} runs {s['start']}-{s['end']}s but should start at {t}s and end after that: shots must "
+                 "touch end to end, in time order (each start = the previous end). Fix the shots file and run again.")
+    t = s["end"]
+
 # The last shot runs to the end of the voiceover; an end card (optional) goes after it.
 shots[-1]["end"] = max(shots[-1]["end"], vo_len)
 segments = list(shots)
@@ -66,21 +92,33 @@ total = segments[-1]["end"]
 
 
 # ---------- 1. picture, one segment per shot ----------
-def still(src, d, seg, zoom=True):
-    frames = int(d * FPS) + 1
+def still(src, n, seg, zoom=True):
     if zoom:    # slow push-in so stills don't look frozen
         vf = (f"scale={w * 2}:{h * 2}:force_original_aspect_ratio=increase,crop={w * 2}:{h * 2},"
-              f"zoompan=z='min(zoom+0.0007,1.08)':d={frames}:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'"
+              f"zoompan=z='min(zoom+0.0007,1.08)':d={n}:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'"
               f":s={w}x{h}:fps={FPS},setsar=1")
     else:
         vf = fill
-    run_ffmpeg(["-loop", "1", "-i", src, "-vf", vf, "-t", f"{d}"] + enc + [seg])
+    run_ffmpeg(["-loop", "1", "-i", src, "-vf", vf, "-frames:v", str(n)] + enc + [seg])
+
+
+def check_in(sid, src, start_in):
+    # Starting at or past the clip's end makes an empty segment, and every later shot would move up.
+    n = duration(src)
+    if start_in >= n - 1.0 / FPS:
+        sys.exit(f'{sid} would start {start_in}s into {rel(src)}, which is only {n:.2f}s long. '
+                 'Check its "in" (or the clip).')
 
 
 parts = []
 clip_audio = []          # (path, in-point, start on timeline, length) for shots that keep their own sound
+pos = 0                  # frames so far: each segment ends on the frame nearest its end time, so cuts don't drift
 for s in segments:
     d = round(s["end"] - s["start"], 3)
+    n = round(s["end"] * FPS) - pos
+    pos += n
+    if n < 1:
+        sys.exit(f"{s['id']} is {d}s long, shorter than one frame. Make it longer or remove it.")
     seg = os.path.join(tmp, s["id"] + ".mp4")
     kind = s.get("type", "clip")
     src = clip_path(P, s)
@@ -91,31 +129,36 @@ for s in segments:
         else:
             sys.exit(f"Missing clip for {s['id']}: {src}")
     if kind == "image":
-        still(os.path.join(P, s["source"]), d, seg, s.get("zoom", True))
+        still(os.path.join(P, s["source"]), n, seg, s.get("zoom", True))
     elif kind == "text":
         bg = s.get("source") or s.get("frame")
         if bg and os.path.splitext(bg)[1].lower() in (".mp4", ".mov"):
+            check_in(s["id"], os.path.join(P, bg), s.get("in", 0))
             run_ffmpeg(["-ss", f"{s.get('in', 0)}", "-i", os.path.join(P, bg), "-vf",
-                        f"{fill},tpad=stop_mode=clone:stop_duration={d}", "-t", f"{d}"] + enc + [seg])
+                        f"{fill},tpad=stop_mode=clone:stop_duration={d}", "-frames:v", str(n)] + enc + [seg])
         elif bg:
-            still(os.path.join(P, bg), d, seg, s.get("zoom", True))
+            still(os.path.join(P, bg), n, seg, s.get("zoom", True))
         else:
             run_ffmpeg(["-f", "lavfi", "-i", f"color=c={s.get('bg', '#111111')}:s={w}x{h}:r={FPS}",
-                        "-t", f"{d}"] + enc + [seg])
+                        "-frames:v", str(n)] + enc + [seg])
     else:
         start_in = s.get("in", s["start"] if kind in ("avatar", "footage") else 0)   # library clips start at 0 unless "in" is set
+        check_in(s["id"], src, start_in)
         speed = s.get("speed", 1.0)       # only ever set when the user asks
         vf = f"setpts=PTS/{speed},{fill},tpad=stop_mode=clone:stop_duration={d}"
-        run_ffmpeg(["-ss", f"{start_in}", "-i", src, "-vf", vf, "-t", f"{d}"] + enc + [seg])
+        run_ffmpeg(["-ss", f"{start_in}", "-i", src, "-vf", vf, "-frames:v", str(n)] + enc + [seg])
         if s.get("use_clip_audio"):
             clip_audio.append((src, start_in, s["start"], d))
     parts.append(seg)
 
 listfile = os.path.join(tmp, "concat.txt")
-with open(listfile, "w") as f:
-    f.writelines("file '%s'\n" % p.replace("\\", "/") for p in parts)
+with open(listfile, "w") as f:    # bare names (the segments sit next to the list): a quote in a full path breaks it
+    f.writelines("file '%s'\n" % os.path.basename(p).replace("'", "'\\''") for p in parts)
 video = os.path.join(tmp, "video.mp4")
 run_ffmpeg(["-f", "concat", "-safe", "0", "-i", listfile, "-c", "copy", video])
+if abs(duration(video) - total) > 1.0 / FPS:
+    sys.exit(f"The picture came out {duration(video):.2f}s long but the shots add up to {total:.2f}s: a shot is "
+             'empty or too short. Check the clips and their "in" points.')
 
 # ---------- 2. sound: voiceover + clip voices + music, loudness-normalised, to a WAV ----------
 # Picture and sound are made separately and joined at the end. Doing both in one filter graph
@@ -174,7 +217,8 @@ if not labels:
     chains.append("[0:a]atrim=0:%s[si]" % total)
     labels.append("[si]")
 mix = (f"{''.join(labels)}amix=inputs={len(labels)}:normalize=0," if len(labels) > 1 else f"{labels[0]}anull,")
-af = ";".join(chains) + f";{mix}loudnorm=I=-14:TP=-1.5:LRA=11,aresample=48000[a]"
+# asetpts: loudnorm shifts the timestamps, and without it -t cut the last 25-75ms of the sound
+af = ";".join(chains) + f";{mix}loudnorm=I=-14:TP=-1.5:LRA=11,aresample=48000,asetpts=N/SR/TB[a]"
 run_ffmpeg(ins + ["-filter_complex", af, "-map", "[a]", "-t", f"{total}", "-c:a", "pcm_s16le", snd])
 
 
@@ -210,20 +254,40 @@ events = []
 words_path = os.path.join(P, data.get("words", "words.json"))
 captions_on = not a.no_captions and user_cap is not False and (not isinstance(user_cap, dict) or user_cap.get("preset") != "none")
 has_speech = bool(vo) or bool(clip_audio)
-if captions_on and has_speech and not os.path.exists(words_path):
-    # No word timings yet (e.g. voices came from the clips): transcribe the finished sound.
+# With no voiceover the words are heard from the clips' own voices. Note which clips (and where) they were
+# heard from, so a remade, moved or trimmed talking clip gets new captions instead of the old words.
+heard_from = words_path + ".src"
+stale = False
+if not vo:
+    heard = json.dumps([[rel(src), os.path.getmtime(src), start_in, at, d] for src, start_in, at, d in clip_audio])
+    if os.path.exists(words_path) and not os.path.exists(heard_from):
+        with open(heard_from, "w", encoding="utf-8") as f:    # words made before this record existed: keep them
+            f.write(heard)
+    elif os.path.exists(words_path):
+        with open(heard_from, encoding="utf-8") as f:
+            stale = f.read() != heard
+if captions_on and has_speech and (stale or not os.path.exists(words_path)):
+    # No word timings yet, or the clips' voices changed: transcribe the finished sound.
+    if stale:
+        print(f"  the clips' voices changed since {rel(words_path)} was made: transcribing them again")
     subprocess.run([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "transcribe.py"),
-                    snd, P, "--no-draft", "--words-out", os.path.relpath(words_path, P)], check=True)
+                    snd, P, "--no-draft", "--words-out", rel(words_path)]
+                   + (["--language", data["language"]] if data.get("language") else []), check=True)
+    if not vo:
+        with open(heard_from, "w", encoding="utf-8") as f:
+            f.write(heard)
 
 if captions_on and has_speech and os.path.exists(words_path):
     from PIL import ImageFont
-    with open(words_path) as f:
+    with open(words_path, encoding="utf-8") as f:
         words = json.load(f)
     try:
         measure = ImageFont.truetype(cap["font_file"], fsize)
+        if cap["lines"] > 1:    # lines are broken here, so measure at the size libass draws (ascent + descent = fsize)
+            measure = ImageFont.truetype(cap["font_file"], round(fsize * fsize / sum(measure.getmetrics())))
     except (OSError, TypeError):
         measure = ImageFont.load_default()
-    limit = int(w * cap["max_width"]) * cap["lines"]
+    limit = int(w * cap["max_width"])     # one line
 
     def show(x):
         return x["w"].upper() if cap["uppercase"] else x["w"]
@@ -231,10 +295,26 @@ if captions_on and has_speech and os.path.exists(words_path):
     def width(ch):
         return measure.getlength(" ".join(show(x) for x in ch)) + 2 * outline
 
-    # A chunk ends at punctuation, a pause, max_words, or when the next word would overflow. Never 3 lines.
+    def rows(ch):
+        # Break the lines here with the same measure, so libass never wraps (and never makes a 3rd line).
+        out = [[]]
+        for x in ch:
+            if out[-1] and width(out[-1] + [x]) > limit:
+                out.append([])
+            out[-1].append(x)
+        return out
+
+    def join(lines, texts):
+        out, k = [], 0
+        for r in lines:
+            out.append(" ".join(texts[k:k + len(r)]))
+            k += len(r)
+        return "\\N".join(out)
+
+    # A chunk ends at punctuation, a pause, max_words, or when the next word would need one line too many.
     chunks, cur = [], []
     for i, wd in enumerate(words):
-        if cur and width(cur + [wd]) > limit:
+        if cur and len(rows(cur + [wd])) > cap["lines"]:
             chunks.append(cur)
             cur = []
         cur.append(wd)
@@ -261,17 +341,19 @@ if captions_on and has_speech and os.path.exists(words_path):
     for ci, ch in enumerate(chunks):
         end = min(chunks[ci + 1][0]["s"], ch[-1]["e"] + 0.6) if ci + 1 < len(chunks) else ch[-1]["e"] + 0.6
         texts = [show(x) for x in ch]
-        fit = "" if width(ch) <= limit else "{\\fs%d}" % int(fsize * limit / width(ch))   # shrink, never wrap
-        tag = pos_tag(ch[0]["s"]) + fit + ("{\\q2}" if cap["lines"] == 1 else "{\\q0}")
+        lines = rows(ch)
+        widest = max(width(r) for r in lines)
+        fit = "" if widest <= limit else "{\\fs%d}" % int(fsize * limit / widest)   # a long word shrinks, never wraps
+        tag = pos_tag(ch[0]["s"]) + fit + "{\\q2}"
         if cap.get("highlight"):
             for wi, wd in enumerate(ch):
                 st = ch[0]["s"] if wi == 0 else wd["s"]
                 en = ch[wi + 1]["s"] if wi + 1 < len(ch) else end
-                body = " ".join(("{\\c" + ass_colour(cap["highlight"]) + "}" + t + "{\\c" + ass_colour(cap["colour"]) + "}")
-                                if k == wi else t for k, t in enumerate(texts))
+                body = join(lines, [("{\\c" + ass_colour(cap["highlight"]) + "}" + t + "{\\c" + ass_colour(cap["colour"]) + "}")
+                                    if k == wi else t for k, t in enumerate(texts)])
                 events.append(f"Dialogue: 0,{ass_time(st)},{ass_time(en)},Cap,,0,0,0,,{tag}{body}")
         else:
-            events.append(f"Dialogue: 0,{ass_time(ch[0]['s'])},{ass_time(end)},Cap,,0,0,0,,{tag}{' '.join(texts)}")
+            events.append(f"Dialogue: 0,{ass_time(ch[0]['s'])},{ass_time(end)},Cap,,0,0,0,,{tag}{join(lines, texts)}")
 
 # Text cards and on-screen text: centred, wrap onto as many lines as needed, inside the 4:5 zone.
 for s in shots:
@@ -305,12 +387,19 @@ Style: Card,{cap['font']},{card_size},&H00FFFFFF&,&H000000FF&,&H00000000&,&H0000
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 """
-    with open(os.path.join(tmp, "captions.ass"), "w") as f:
+    with open(os.path.join(tmp, "captions.ass"), "w", encoding="utf-8") as f:     # libass reads UTF-8
         f.write(ass + "\n".join(events) + "\n")
-    fontsdir = os.path.dirname(cap["font_file"]) if cap["font_file"] else None
-    vf = "ass=captions.ass" + (f":fontsdir='{fontsdir}'" if fontsdir else "")
+    vf = "ass=captions.ass"
+    if cap["font_file"]:
+        # libass gets a copy of the font next to the captions: a drive colon (C:/Windows/Fonts) or a quote
+        # in the font's own folder breaks the filter.
+        fonts = os.path.join(tmp, "fonts")
+        shutil.rmtree(fonts, ignore_errors=True)
+        os.makedirs(fonts)
+        shutil.copy(cap["font_file"], fonts)
+        vf += ":fontsdir=fonts"
     r = subprocess.run([ffmpeg(), "-hide_banner", "-loglevel", "error", "-y", "-i", video, "-vf", vf]
-                       + final_enc + [pic], cwd=tmp, capture_output=True, text=True)
+                       + final_enc + [pic], cwd=tmp, capture_output=True, text=True, encoding="utf-8", errors="replace")
     if r.returncode != 0:
         sys.exit("ffmpeg failed (captions):\n" + r.stderr[-2000:])
 
@@ -319,7 +408,8 @@ run_ffmpeg(["-i", pic, "-i", snd, "-map", "0:v", "-map", "1:a", "-c:v", "copy", 
             "-t", f"{total}", "-movflags", "+faststart", out])
 
 # ---------- 5. quick sound check: full length, no early end ----------
-r = subprocess.run([ffmpeg(), "-hide_banner", "-i", out, "-map", "0:a", "-f", "null", "-"], capture_output=True, text=True)
+r = subprocess.run([ffmpeg(), "-hide_banner", "-i", out, "-map", "0:a", "-f", "null", "-"], capture_output=True,
+                   text=True, encoding="utf-8", errors="replace")
 times = re.findall(r"time=(\d+):(\d+):([\d.]+)", r.stderr)
 audio_len = (lambda t: int(t[0]) * 3600 + int(t[1]) * 60 + float(t[2]))(times[-1]) if times else 0
 print(f"saved {out}  ({total:.1f}s, {len(segments)} shots"

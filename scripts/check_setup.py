@@ -41,6 +41,14 @@ for item in a.set:
         p = providers.get(name)
         if slot not in p.slots:
             sys.exit(f"{p.label} can't do {slot}. It does: {', '.join(p.slots)}")
+        if slot == "lipsync" and model:
+            sys.exit("Lip-sync and avatar share this slot, so a model can't be pinned here. "
+                     "Pick it per run with: generate.py lipsync (or avatar) --model <id>")
+        # Kie and Replicate take voices from a fixed list (free to check): one saved for another provider may be missing
+        new_list = name in ("kie", "replicate") and name != s[slot].get("provider")
+        if slot == "voice" and keep.get("voice_id") and new_list:
+            if keep["voice_id"] not in [v[0] for v in p.voices()]:
+                print(f"Saved voice {keep.pop('voice_id')} isn't available on {name}: pick one with generate.py voices")
         s[slot] = {**keep, "mode": "api", "provider": name, **({"model": model} if model else {})}
     elif mode in ("mcp", "manual"):
         s[slot] = {**keep, "mode": mode, **({"tool": rest} if rest else {})}

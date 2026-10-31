@@ -2,8 +2,10 @@
 
     variants.py <project> [--sizes 4x5 1x1 16x9] [--files final/x_9x16_v1.mp4 ...]
 
-4x5 (1080x1350) and 1x1 (1080x1080) are centre crops: the 4:5 safe zone in every frame keeps faces,
-products and captions inside them. 16x9 (1920x1080) puts the 9:16 picture in the middle over a
+4x5 (1080x1350) and 1x1 (1080x1080) are centre crops. 4x5 keeps 15%-85% of the height, so the 4:5 safe
+zone in every frame keeps faces, products and captions inside it. 1x1 keeps only the middle 22%-78%:
+anything above or below that (a low caption, on-screen text, a product at the bottom) is cut, so check
+the 1x1 files by eye. 16x9 (1920x1080) puts the 9:16 picture in the middle over a
 blurred, darkened copy of itself. Default files: every *_9x16_*.mp4 in final/ (not previews).
 Output names swap 9x16 for the size, e.g. ad_hookA_4x5_v1.mp4. Sound is copied untouched.
 """
@@ -40,3 +42,5 @@ for src in files:
                     "-pix_fmt", "yuv420p",
                     "-c:a", "copy", "-movflags", "+faststart", out])
         print("saved", out)
+if "1x1" in a.sizes:
+    print("1x1 keeps only the middle 22%-78% of the height: look at it for cut-off captions, text, products or faces.")
