@@ -5,7 +5,8 @@
 Reads the shots file (see SKILL.md) and the word timings. Shots must touch end to end; each one fills
 exactly start -> end, cut on the nearest frame, so cuts land on the words.
 --preview renders fast at 540x960 to final/preview_<hook>.mp4. Otherwise the file is
-final/<project>_<hook>_9x16_v<n>.mp4 with the next free version number.
+final/<project>_<hook>_9x16_v<n>.mp4 with the next free version number. A shot that hasn't changed since an
+earlier cut (same file, same in point, length and size) is taken from tmp/segments/, not encoded again.
 
 Shot types: clip / talking (generated clips), avatar (an AI talking-avatar video, kept in sync),
 image (a still with a slow push-in), text (a text card). Any shot can also carry "on_screen": "<text>".
@@ -15,12 +16,14 @@ no sound track, a clip too short for its shot: "freeze_ok": true allows that one
 avatar and talking shots and never on a text card or on-screen text: they move below (or above) it.
 """
 import argparse
+import hashlib
 import json
 import os
 import re
 import shutil
 import subprocess
 import sys
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from common import CLIP_TYPES, H, W, clip_path, duration, ffmpeg, ffmpeg_fix, find_font, run_ffmpeg, sentence_end
@@ -129,6 +132,18 @@ def number(v):
     return isinstance(v, (int, float)) and not isinstance(v, bool)
 
 
+def caption_pos_ok(v):
+    return number(v) and 0 < v < 1 or v in ("middle", "low")
+
+
+def caption_pos_note(where, k, v):
+    """Captions never go above 0.35 or below 0.8 of the height: say so when a fraction asks for that."""
+    if number(v) and not 0.35 <= v <= 0.8:
+        pos_notes.append(f'{where}: "{k}" {v} is used as {min(max(v, 0.35), 0.8)}: captions stay between 0.35 '
+                         "and 0.8 of the height (clear of the top and of the app's buttons at the bottom)")
+
+
+pos_notes = []
 if vo:
     need_file('the voiceover ("vo")', vo, sound=True)
 for i, s in enumerate(shots):
@@ -148,11 +163,12 @@ for i, s in enumerate(shots):
         problems.append(f'{sid} needs a "start" and an "end" in seconds')
     for k, ok in (("in", lambda v: number(v) and v >= 0), ("speed", lambda v: number(v) and v > 0),
                   ("text_pos", lambda v: number(v) and 0 < v < 1),
-                  ("caption_pos", lambda v: number(v) and 0 < v < 1 or v in ("middle", "low"))):
+                  ("caption_pos", caption_pos_ok)):
         if k in s and not ok(s[k]):
             problems.append(f'{sid}: "{k}" is {json.dumps(s[k])}, which isn\'t '
                             + ('"middle", "low" or a fraction of the height (0.5 = middle)' if k == "caption_pos" else
                                "a fraction of the height (0.5 = middle)" if k == "text_pos" else "a usable number"))
+    caption_pos_note(sid, "caption_pos", s.get("caption_pos"))
     kind = s.get("type", "clip")
     if kind not in KINDS:
         problems.append(f'{sid}: type "{kind}" isn\'t one of {", ".join(KINDS)}')
@@ -171,10 +187,11 @@ for i, s in enumerate(shots):
                             'and Higgsfield make clips with the sound off). Remake it with sound, or lip-sync it '
                             'to a voiceover and take "use_clip_audio" off')
     elif not s.get("source") and not s.get("clip"):
-        problems.append(f'{sid}: a {kind} shot needs "source" (the video file)')
+        problems.append(f'{sid}: {"an" if kind == "avatar" else "a"} {kind} shot needs "source" (the video file)')
     else:
         need_file(f"{sid}: video", clip_path(P, s), sound=bool(s.get("use_clip_audio")))
-    src = clip_path(P, s) if kind not in ("image", "text") else None
+    has_video = kind in CLIP_TYPES or kind not in ("image", "text") and (s.get("source") or s.get("clip"))
+    src = clip_path(P, s) if has_video else None      # a library/avatar shot with no "source" is listed above
     if src and os.path.isfile(src) and src not in hdr_seen:
         hdr_seen.add(src)
         if is_hdr(src):      # a phone's HDR (HLG/PQ) clip looks flat and washed out in an SDR ad
@@ -195,9 +212,20 @@ if data.get("endcard"):
         need_file("the end card", os.path.join(P, data["endcard"]["image"]))
 if isinstance(user_cap, dict) and user_cap.get("preset", "bold") not in ("bold", "clean", "none"):
     problems.append(f'captions preset "{user_cap["preset"]}" isn\'t one of bold, clean, none')
+if isinstance(user_cap, dict) and "position" in user_cap:
+    if not caption_pos_ok(user_cap["position"]):
+        problems.append(f'captions "position" is {json.dumps(user_cap["position"])}, which isn\'t "middle", "low" or a '
+                        "fraction of the height (0.5 = middle)")
+    caption_pos_note("captions", "position", user_cap["position"])
 if problems:
     sys.exit(f"{a.shots}: fix {'this' if len(problems) == 1 else 'these'} and run again:\n  " + "\n  ".join(problems))
+for x in pos_notes:
+    print("  " + x)
 vo_len = duration(vo) if vo else 0.0
+
+
+def q(x):       # a path with a space in it, quoted for the shell
+    return f'"{x}"' if " " in x and not x.startswith("<") else x
 
 
 def timing_cmd():
@@ -207,9 +235,6 @@ def timing_cmd():
     if not os.path.exists(os.path.join(P, script)):
         script = "<this hook's script file>" if is_hook else "<the script file>"
     lang = f" --language {data['language']}" if data.get("language") else ""
-
-    def q(x):       # a path with a space in it, quoted for the shell
-        return f'"{x}"' if " " in x and not x.startswith("<") else x
     # A hook's own voiceover is always timed into the hook's own words file, never over the main ad's words.json.
     target = f"words_{hook}.json" if is_hook and words_rel == "words.json" else words_rel
     also = f'  (then set "words": "{target}" in {a.shots})' if target != words_rel or not data.get("words") and is_hook else ""
@@ -243,15 +268,26 @@ if vo and captions_on and not os.path.exists(words_path):
 if vo and os.path.exists(words_path):
     words = load_words(words_path)
     last = words[-1]["e"] if words else 0.0
+    # Words past the end of the voiceover come from another (longer) take, or from a script that says more than it.
+    short_vo = ("If it was timed from this take, the voiceover is shorter than the script: listen to its end (a take "
+                "cut off, or a line it doesn't say) and remake it, or take those words out of the script.")
     if not words:
         notes.append(f"{words_rel} has no words, so there are no captions. Time the voiceover again: {timing_cmd()}")
     elif last > vo_len + 0.5 and captions_on:
-        # Words past the end of the voiceover can only come from another (longer) take: every caption would be wrong.
         sys.exit(f"{words_rel} ends at {last:.1f}s but the voiceover is only {vo_len:.1f}s long: it was made from "
-                 f"another take, so the captions would be wrong. Time it again:\n  {timing_cmd()}")
-    elif last > vo_len + 0.5 or vo_len - last > 2.0:
-        notes.append(f"WARNING {words_rel} ends at {last:.1f}s but the voiceover is {vo_len:.1f}s long: it was made "
-                     f"from another take, so the captions would be out of sync. Time it again: {timing_cmd()}")
+                 f"another take, so the captions would be wrong. Time it again:\n  {timing_cmd()}\n{short_vo}")
+    elif last > vo_len + 0.5:
+        notes.append(f"WARNING {words_rel} ends at {last:.1f}s but the voiceover is only {vo_len:.1f}s long, so the "
+                     f"cuts would be off the words. {short_vo} If it was made from another take, time it again: "
+                     f"{timing_cmd()}")
+    elif vo_len - last > 2.0:
+        # Music or room tone at the end of the file looks the same as a longer take here; timing it again can't
+        # change the first, so give both.
+        trimmed = "%s_trimmed%s" % os.path.splitext(data["vo"])
+        notes.append(f"WARNING {data['vo']} goes on {vo_len - last:.1f}s after the last word in {words_rel} "
+                     f"({last:.1f}s), so the ad runs on that long past it. If that's music, room tone or silence, "
+                     f"it's fine as it is, or trim it (ffmpeg -i {q(data['vo'])} -t {last + 0.5:.1f} {q(trimmed)}) and "
+                     f'set "vo" to {trimmed}. If it\'s a newer take with more words, time it again: {timing_cmd()}')
     elif os.path.getmtime(words_path) < os.path.getmtime(vo) - 1:
         notes.append(f"{data['vo']} changed after {words_rel} was made. If it's a new take, time it again "
                      f"({timing_cmd()}) or the captions drift.")
@@ -278,7 +314,9 @@ else:
         n += 1
     out = f"{base}{n}.mp4"
 tmp = os.path.join(P, "tmp", hook)
+cache = os.path.join(P, "tmp", "segments")      # cut shots, shared by every run and hook (see cut())
 os.makedirs(tmp, exist_ok=True)
+os.makedirs(cache, exist_ok=True)
 os.makedirs(os.path.dirname(out), exist_ok=True)
 w, h = (540, 960) if a.preview else (W, H)
 FPS = 30
@@ -309,20 +347,64 @@ if vo and vo_len - plan_end > 1.0 and (late or words is None):
 segments = list(shots)
 if data.get("endcard"):
     ec = data["endcard"]
-    segments.append({"id": "endcard", "type": "image", "source": ec["image"],
+    segments.append({"id": "endcard", "type": "image", "source": ec["image"], "bg": ec.get("bg"),
                      "start": shots[-1]["end"], "end": shots[-1]["end"] + ec.get("seconds", 3), "zoom": False})
 total = segments[-1]["end"]
 
 
 # ---------- 1. picture, one segment per shot ----------
-def still(sid, src, n, seg, zoom=True):
+def safe(sid):      # a shot's id as part of a file name
+    return re.sub(r"[^\w-]", "_", sid)[:40]
+
+
+def flat(s, src):
+    """A see-through picture (a logo, a cut-out product) laid on the shot's "bg". Without this the video shows the
+    colour hidden under its clear pixels, which is whatever the program that saved it left there."""
+    from PIL import Image, ImageColor, ImageOps
+    who, where = (("the end card", 'in "endcard"') if s["id"] == "endcard" else (s["id"], "on the shot"))
+    try:
+        im = Image.open(src)
+        im.load()
+    except (OSError, ValueError):
+        # Not one PIL reads. ffmpeg reads more kinds, but with "-loop 1" it retries a broken file for ever (and the
+        # edit hangs), so it must read one frame of it first.
+        r = subprocess.run([ffmpeg(), "-hide_banner", "-loglevel", "error", "-i", src, "-frames:v", "1", "-f", "null",
+                            "-"], capture_output=True, text=True, encoding="utf-8", errors="replace")
+        if r.returncode != 0:
+            sys.exit(f"{who}: {rel(src)} isn't a picture that can be read (a broken or half-downloaded file?). "
+                     "Replace it, or point the shot at another picture.")
+        return src
+    if "A" not in im.getbands() and "transparency" not in im.info:
+        return src
+    im = ImageOps.exif_transpose(im).convert("RGBA")
+    if im.getchannel("A").getextrema()[0] == 255:      # an alpha channel with nothing see-through in it
+        return src
+    bg = s.get("bg") or ("#111111" if s.get("type") == "text" else "#000000")
+    try:
+        colour = ImageColor.getrgb(str(bg).replace("0x", "#", 1))[:3]
+    except ValueError:
+        colour, bg = (0, 0, 0), f'#000000 ("bg" {json.dumps(bg)} isn\'t a colour: use one like "#1a1a1a")'
+    notes.append(f'{who}: {rel(src)} has a transparent background, shown on {bg} (set "bg" {where} to change it)')
+    st = os.stat(src)
+    key = json.dumps([src, st.st_size, st.st_mtime_ns, colour])
+    out = os.path.join(cache, f"{safe(s['id'])}_flat_{hashlib.sha1(key.encode()).hexdigest()[:16]}.png")
+    if not os.path.exists(out):
+        back = Image.new("RGBA", im.size, colour + (255,))
+        back.alpha_composite(im)
+        back.convert("RGB").save(out + ".part.png", compress_level=1)
+        os.replace(out + ".part.png", out)
+    return out
+
+
+def still(s, src, n, zoom=True):
+    src = flat(s, src)
     if zoom:    # slow push-in so stills don't look frozen
         vf = (f"scale={w * 2}:{h * 2}:force_original_aspect_ratio=increase,crop={w * 2}:{h * 2},"
               f"zoompan=z='min(zoom+0.0007,1.08)':d={n}:x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'"
               f":s={w}x{h}:fps={FPS},setsar=1")
     else:
         vf = fill
-    cut(sid, ["-loop", "1", "-i", src, "-vf", vf, "-frames:v", str(n)] + enc + [seg])
+    return cut(s["id"], ["-loop", "1", "-i", src, "-vf", vf, "-frames:v", str(n)] + enc)
 
 
 def check_in(s, src, start_in, d):
@@ -351,12 +433,41 @@ def check_in(s, src, start_in, d):
              + ("" if stretched else "shorten the shot, ") + f'or {remake}. ("freeze_ok": true on the shot allows it.)')
 
 
+reused = []
+
+
 def cut(sid, args):
+    """One shot's segment: ffmpeg's args without the output file. It is kept in tmp/segments under a name made of
+    everything that shapes it (the whole command, and the size and time of ffmpeg and of every file it reads), so
+    a later run, or a hook with the same shot, uses it again instead of encoding it again."""
+    files = [ffmpeg()] + [args[i + 1] for i, x in enumerate(args[:-1]) if x == "-i" and os.path.isfile(args[i + 1])]
+    key = json.dumps([args] + [[f, os.stat(f).st_size, os.stat(f).st_mtime_ns] for f in files])
+    name = f"{safe(sid)}_{hashlib.sha1(key.encode()).hexdigest()[:16]}"
+    seg = os.path.join(cache, name + ".mp4")
+    if os.path.exists(seg):
+        os.utime(seg)       # used: the clean-up below keeps it
+        reused.append(sid)
+        return seg
+    part = os.path.join(cache, f"{name}.{os.getpid()}.part.mp4")     # never a half-made segment under the real name
     try:
-        run_ffmpeg(args)
+        run_ffmpeg(args + [part])
+        if not os.path.exists(seg):     # another run (a hook cut at the same time) may have made it meanwhile
+            os.replace(part, seg)
     except SystemExit as e:       # name the shot, not just ffmpeg's error
         sys.exit(f"{sid}: couldn't cut this shot. {e.code}")
+    finally:
+        if os.path.exists(part):
+            os.remove(part)
+    return seg
 
+
+# What no run has used for a week goes, so a long project doesn't fill the disk (a flattened picture is made again).
+for f in os.listdir(cache):
+    try:
+        if os.path.getmtime(os.path.join(cache, f)) < time.time() - 7 * 86400:
+            os.remove(os.path.join(cache, f))
+    except OSError:       # another run took it first
+        pass
 
 parts = []
 clip_audio = []          # (path, in-point, start on timeline, length) for shots that keep their own sound
@@ -367,7 +478,6 @@ for s in segments:
     pos += n
     if n < 1:
         sys.exit(f"{s['id']} is {d}s long, shorter than one frame. Make it longer or remove it.")
-    seg = os.path.join(tmp, s["id"] + ".mp4")
     kind = s.get("type", "clip")
     src = clip_path(P, s)
     if kind in CLIP_TYPES and not os.path.exists(src):
@@ -381,35 +491,42 @@ for s in segments:
             sys.exit(f"{s['id']} has no clip: {rel(src)} doesn't exist. Make it (generate.py clips . --only {s['id']}), "
                      'point "clip" at the right file, or give the shot a "frame" to show as a still for now.')
     if kind == "image":
-        still(s["id"], os.path.join(P, s["source"]), n, seg, s.get("zoom", True))
+        seg = still(s, os.path.join(P, s["source"]), n, s.get("zoom", True))
     elif kind == "text":
         bg = s.get("source") or s.get("frame")
         if bg and os.path.splitext(bg)[1].lower() in (".mp4", ".mov"):
             check_in(s, os.path.join(P, bg), s.get("in", 0), d)
-            cut(s["id"], ["-ss", f"{s.get('in', 0)}", "-i", os.path.join(P, bg), "-vf",
-                          f"{fill},tpad=stop_mode=clone:stop_duration={d}", "-frames:v", str(n)] + enc + [seg])
+            seg = cut(s["id"], ["-ss", f"{s.get('in', 0)}", "-i", os.path.join(P, bg), "-vf",
+                                f"{fill},tpad=stop_mode=clone:stop_duration={d}", "-frames:v", str(n)] + enc)
         elif bg:
-            still(s["id"], os.path.join(P, bg), n, seg, s.get("zoom", True))
+            seg = still(s, os.path.join(P, bg), n, s.get("zoom", True))
         else:
-            cut(s["id"], ["-f", "lavfi", "-i", f"color=c={s.get('bg', '#111111')}:s={w}x{h}:r={FPS}",
-                          "-frames:v", str(n)] + enc + [seg])
+            seg = cut(s["id"], ["-f", "lavfi", "-i", f"color=c={s.get('bg', '#111111')}:s={w}x{h}:r={FPS}",
+                                "-frames:v", str(n)] + enc)
     else:
         start_in = s.get("in", s["start"] if kind in ("avatar", "footage") else 0)   # library clips start at 0 unless "in" is set
         check_in(s, src, start_in, d)
         speed = s.get("speed", 1.0)       # only ever set when the user asks
         vf = f"setpts=PTS/{speed},{fill},tpad=stop_mode=clone:stop_duration={d}"
-        cut(s["id"], ["-ss", f"{start_in}", "-i", src, "-vf", vf, "-frames:v", str(n)] + enc + [seg])
+        seg = cut(s["id"], ["-ss", f"{start_in}", "-i", src, "-vf", vf, "-frames:v", str(n)] + enc)
         if s.get("use_clip_audio"):
             clip_audio.append((src, start_in, s["start"], d))
     parts.append(seg)
+if reused:
+    print(f"  {len(reused)} of {len(segments)} shots unchanged since an earlier cut: used again, not encoded again")
 
 listfile = os.path.join(tmp, "concat.txt")
-# Bare names (the segments sit next to the list): a quote in a full path breaks it.
+# Paths from the list's own folder: a quote or a drive colon in the full path breaks it.
 with open(listfile, "w", encoding="utf-8") as f:
-    f.writelines("file '%s'\n" % os.path.basename(p).replace("'", "'\\''") for p in parts)
+    f.writelines("file '../segments/%s'\n" % os.path.basename(p).replace("'", "'\\''") for p in parts)
 video = os.path.join(tmp, "video.mp4")
 run_ffmpeg(["-f", "concat", "-safe", "0", "-i", listfile, "-c", "copy", video])
 if abs(duration(video) - total) > 1.0 / FPS:
+    for p in parts:       # don't use a bad segment again next run
+        try:
+            os.remove(p)
+        except OSError:
+            pass
     sys.exit(f"The picture came out {duration(video):.2f}s long but the shots add up to {total:.2f}s: a shot is "
              'empty or too short. Check the clips and their "in" points.')
 

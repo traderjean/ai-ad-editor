@@ -28,25 +28,33 @@ Slot modes (providers.json):
   none    exit 2: no tool chosen yet, run check_setup.py
 """
 import argparse
+import atexit
 import concurrent.futures as cf
+import datetime
 import inspect
 import json
 import math
 import os
 import shutil
+import socket
 import sys
+import threading
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import providers
-from common import (QUALITIES, SLOTS, SPEND_LOG, check_spend, duration, find_project, load_budget, load_json,
-                    load_settings, log_spend, mmss, project_name, spend_rows, spent, voiceover_file)
+from common import (QUALITIES, SLOTS, SPEND_LOG, check_spend, duration, ffmpeg, find_project, load_budget, load_json,
+                    load_settings, log_spend, mmss, project_name, read_text, rel, spend_rows, spent, voiceover_file)
 
 CLIP_TYPES = ("clip", "veo", "talking")      # shot types that need a generated clip ("veo" = old name)
 FIT_MARGIN = 1.0                             # --fit: up to a spare second per clip for trims and small re-timings
 FIT_PAD = 0.25                               # ... but for an adapter that rounds lengths up itself, only this much,
                                              # so a 3.1s shot stays a 4s clip instead of stepping up to 6s
+LOCK = ".generate.lock"                      # <project>/.generate.lock while a paid run works on that project
+BEAT, STALE = 20, 120                        # the run touches it every BEAT s; one untouched for STALE s is dead
 # Error texts (providers/) that mean the job may exist and be paid for even though it failed here.
-MAYBE_PAID = ("Made, but the download failed", "may have started", "Lost track", "may still finish")
+MAYBE_PAID = ("Made, but the download failed", "may have started", "Lost track", "may still finish",
+              "finished but returned no file", "no longer has the file")
 # Error texts that can mean a safety filter turned the prompt down (Kie reports most of those as "task failed").
 REFUSED = ("task failed", "failed (not charged)", "unsafe", "safety", "sensitive", "nsfw", "flagged", "moderation",
            "policy", "generate audio")
@@ -111,18 +119,133 @@ def length_for_tool(seconds):
 
 # ---------- checks before anything is paid ----------
 
-def pending(p, out):
-    """The paid job an earlier run started for `out` and didn't collect (Provider.pending), else None.
-    Stops when another provider left one there: making a new job would drop the paid one."""
+def job_file(out):
+    """What <out>.job.json holds (a paid job not collected yet), else None."""
     try:
         with open(out + ".job.json", encoding="utf-8") as f:
-            other = json.load(f).get("provider")
-    except (OSError, ValueError, AttributeError):
-        other = None
+            job = json.load(f)
+    except (OSError, ValueError):
+        return None
+    return job if isinstance(job, dict) else None
+
+
+def mark_counted(out):
+    """Note in <out>.job.json that the job's cost is in spend_log.csv (it was made but not downloaded), so the
+    run that downloads it later doesn't count it twice."""
+    job = job_file(out)
+    if job is None:
+        return
+    try:
+        with open(out + ".job.json.tmp", "w", encoding="utf-8") as f:
+            json.dump({**job, "counted": True}, f, indent=1)
+        os.replace(out + ".job.json.tmp", out + ".job.json")
+    except OSError:
+        pass
+
+
+def pending(p, out, only=""):
+    """The paid job an earlier run started for `out` and didn't collect (Provider.pending), else None.
+    Stops when another provider left one there: making a new job would drop the paid one.
+    only = the --only that picks this item in a batch command (clips, images)."""
+    other = (job_file(out) or {}).get("provider")
     if p is not None and other and other != p.name:
-        sys.exit(f"{os.path.basename(out)} has an unfinished {other} job from an earlier run (it's paid for): "
-                 f"collect it with --provider {other}, or delete {out}.job.json to drop it, then run this again.")
+        just = f" --only {only} (that one only: the others stay on the slot's provider)" if only else ""
+        sys.exit(f"{os.path.basename(out)} has an unfinished {other} job from an earlier run (it's paid for). Collect "
+                 f"it for free by running this command again with --provider {other}{just}, then run this again. "
+                 f"Only if you really want to give up that paid job, delete {out}.job.json.")
     return p.pending(out) if p is not None and hasattr(p, "pending") else None
+
+
+def lock_owner(path):
+    """The run holding <project>/.generate.lock ({} when it's still writing it), else None: no lock, or the
+    lock of a run that died (it stopped touching the file, or its process is gone)."""
+    try:
+        age = time.time() - os.path.getmtime(path)
+        with open(path, encoding="utf-8") as f:
+            held = json.load(f)
+    except OSError:
+        return None
+    except ValueError:
+        held = {}
+    if age > STALE or not isinstance(held, dict):
+        return None
+    pid = held.get("pid")
+    # os.kill(pid, 0) only asks on Linux and macOS (on Windows it would end that process): there, the age decides.
+    if os.name != "nt" and isinstance(pid, int) and held.get("host") == socket.gethostname():
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return None
+        except OSError:
+            pass
+    return held
+
+
+def holder(held):
+    if not held:
+        return "another generate.py run (starting now)"
+    when = str(held.get("started", ""))[11:16]
+    return f"another generate.py run (pid {held.get('pid', '?')}, started {when}: {held.get('command', '?')})"
+
+
+def lock_project(project, yes):
+    """One paid run per project at a time: a second run started while the first is still working would pay for
+    (or count) the same jobs again. A lock left by a run that died is taken over. An estimate only says so."""
+    path = os.path.join(project, LOCK)
+    held = lock_owner(path)
+    if held and held.get("pid") == os.getpid() and held.get("host") == socket.gethostname():
+        return                             # this process holds it already
+    if not yes:
+        if held is not None:
+            print(f"NOTE {holder(held)} is making things for this project right now: wait for it to finish before "
+                  f"running this with --yes (this estimate may include what it's making).")
+        return
+    me = {"pid": os.getpid(), "host": socket.gethostname(), "command": "generate.py " + " ".join(sys.argv[1:]),
+          "started": datetime.datetime.now().isoformat(timespec="seconds")}
+    for _ in range(3):
+        if held is not None:
+            sys.exit(f"STOPPED: {holder(held)} is making things for this project. Wait for it to finish (it ends with "
+                     f"'Spent on this ad so far'), then run this again: what it made is skipped and a paid job it "
+                     f"left is collected for free. Nothing was made or charged. (If that run was stopped, this "
+                     f"clears by itself within {STALE // 60} minutes.)")
+        if os.path.exists(path):
+            print("NOTE an earlier generate.py run on this project stopped without finishing: taking over (a paid "
+                  "job it left is collected, not paid for again).")
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:            # another run took it just now
+            held = lock_owner(path)
+            continue
+        except OSError:
+            return                         # the folder can't be written: run without the guard
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(me, f)
+        break
+    else:
+        return
+
+    def unlock():
+        try:
+            with open(path, encoding="utf-8") as f:
+                mine = json.load(f) == me
+            if mine:
+                os.remove(path)
+        except (OSError, ValueError):
+            pass
+
+    def beat():
+        while True:
+            time.sleep(BEAT)
+            try:
+                os.utime(path)
+            except OSError:
+                return
+    atexit.register(unlock)
+    threading.Thread(target=beat, daemon=True).start()
 
 
 def finishing(label, job):
@@ -228,7 +351,10 @@ def looks_banded(path):
         from PIL import Image
     except ImportError:
         return False
-    im = Image.open(path).convert("L")
+    try:
+        im = Image.open(path).convert("L")
+    except (OSError, ValueError):      # a format Pillow can't read: the paid image is kept and counted all the same
+        return False
     if im.height <= im.width:
         return False
     g = np.asarray(im.resize((270, 480)), dtype=float)
@@ -255,7 +381,7 @@ def remake_prices(p, qualities, model):
 
 def cmd_image(a):
     stop_on([file_problem(a.prompt_file, a.prompt_file, "--prompt-file")] + [file_problem(r, r, "--ref") for r in a.ref])
-    prompt = open(a.prompt_file, encoding="utf-8").read().strip() if a.prompt_file else a.prompt
+    prompt = read_text(a.prompt_file).strip() if a.prompt_file else a.prompt
     mode, p, cfg = route("image", a.provider)
     quality = a.quality or cfg.get("quality", "standard")
     model = a.model or cfg.get("model")
@@ -265,6 +391,7 @@ def cmd_image(a):
         stop_on([None if prompt else "the prompt is empty"])
         handoff(mode, "image", cfg, outs, prompt, a.ref, {"aspect ratio": a.aspect}, quality, model)
     project = find_project(a.out)
+    lock_project(project, a.yes)
     jobs = {o: pending(p, o) for o in outs}
     est = p.estimate("image", quality, model=model) if quality in QUALITIES else None
     remake = confirm([(finishing(os.path.basename(o), j), 0.0) if j else (os.path.basename(o), est)
@@ -288,6 +415,10 @@ def make_image(p, prompt, o, refs, aspect, quality, model, remake=True, project=
             r2 = p.image(prompt, o, refs=refs, aspect=aspect, quality="best")
         except Exception as e:
             os.replace(f"{base_}_banded{ext_}", o)     # the first take is paid for: keep it where the next steps look
+            if getattr(e, "made", False):              # the remake is paid for too, though its file didn't arrive
+                log_spend(f"{p.name}-image {os.path.basename(o)} (remade on best, made, not downloaded)",
+                          getattr(e, "cost", None), project)
+                mark_counted(o)
             r.note += f" | CHECK: looks banded, and the remake on best failed ({e})"
             return r
         log_spend(f"{p.name}-image {os.path.basename(o)} (banded, remade)", r.cost, project)
@@ -320,6 +451,9 @@ def cmd_images(a):
     mode, p, cfg = route("image", a.provider)
     model = a.model or cfg.get("model")
     default_q = a.quality or cfg.get("quality", "standard")
+    project = find_project(a.jobs)
+    if mode == "api":
+        lock_project(project, a.yes)
 
     def named(j):
         stem = os.path.splitext(os.path.basename(j["out"]))[0]
@@ -331,7 +465,7 @@ def cmd_images(a):
             sys.exit(f"Not in {a.jobs}: {', '.join(bad)}. Name jobs by their file (s03.png) or its name (s03).")
     todo, have = [], 0
     for j in jobs:
-        j["job"] = pending(p, j["out"])
+        j["job"] = pending(p, j["out"], os.path.splitext(os.path.basename(j["out"]))[0])
         if j["job"]:                   # a paid job from an earlier run: collect it, never skip it
             todo.append(j)
         elif a.only:
@@ -354,13 +488,13 @@ def cmd_images(a):
         if j.get("prompt_file"):
             pf = at(j["prompt_file"])
             if os.path.isfile(pf):
-                j["prompt"] = open(pf, encoding="utf-8").read().strip()
+                j["prompt"] = read_text(pf).strip()
             else:
                 problems.append(f"{who}: prompt_file {j['prompt_file']} doesn't exist")
                 continue
         if not str(j.get("prompt") or "").strip():
             problems.append(f'{who}: no "prompt"')
-        problems += [file_problem(r, os.path.relpath(r, root), f"{who}: ref") for r in j["refs"]]
+        problems += [file_problem(r, rel(r, root), f"{who}: ref") for r in j["refs"]]
         problems.append(quality_problem(p, "image", j.get("quality", default_q), model, who))
     if mode != "api":
         stop_on(problems)
@@ -371,7 +505,6 @@ def cmd_images(a):
             except SystemExit:
                 continue
         sys.exit(3 if mode == "mcp" else 4)
-    project = find_project(a.jobs)
 
     def price(j):
         q = j.get("quality", default_q)
@@ -403,7 +536,7 @@ def same_price_any_length(p, quality, model, audio=False):
 
 def cmd_video(a):
     stop_on([file_problem(a.prompt_file, a.prompt_file, "--prompt-file"), file_problem(a.frame, a.frame, "--frame")])
-    prompt = open(a.prompt_file, encoding="utf-8").read().strip() if a.prompt_file else a.prompt
+    prompt = read_text(a.prompt_file).strip() if a.prompt_file else a.prompt
     mode, p, cfg = route("video", a.provider)
     quality = a.quality or cfg.get("quality", "standard")
     seconds = a.seconds or cfg.get("max_seconds", 8)
@@ -415,6 +548,7 @@ def cmd_video(a):
                  "start frame": a.frame or "none", "sound": "on" if a.audio else "off (mute it)"},
                 quality, model)
     project = find_project(a.out)
+    lock_project(project, a.yes)
     job = pending(p, a.out)
     if a.seconds and same_price_any_length(p, quality, model, a.audio):
         print(f"{p.label.split(' (')[0]} charges the same for any clip length, so the clip may come back longer "
@@ -447,20 +581,29 @@ def cmd_clips(a):
             sys.exit(f"Not a clip shot in {a.shots}: {', '.join(bad)}")
     mode, p, cfg = route("video", a.provider)
     clips_dir = os.path.join(a.project, "clips")
+    project = os.path.abspath(a.project)
+    if mode == "api":
+        lock_project(project, a.yes)
 
     def out_of(s):
         return os.path.join(clips_dir, s["id"] + ".mp4")
+
+    def played(s):
+        """The take the edit plays instead of clips/<id>.mp4 (its "clip": a lip-synced or the user's own), if any."""
+        if s.get("clip") and os.path.normpath(os.path.join(a.project, s["clip"])) != os.path.normpath(out_of(s)):
+            return os.path.join(a.project, s["clip"])
     jobs, todo = {}, []
     for s in shots:
         if s.get("type", "clip") not in CLIP_TYPES:
             continue
-        jobs[s["id"]] = pending(p, out_of(s))
+        jobs[s["id"]] = pending(p, out_of(s), s["id"])
         if jobs[s["id"]]:              # a paid job from an earlier run: collect it, never skip it
             todo.append(s)
             continue
         if a.only and s["id"] not in a.only:
             continue
-        if not draft and not a.only and not a.redo and os.path.exists(out_of(s)):
+        if not draft and not a.only and not a.redo and (os.path.exists(out_of(s))
+                                                        or played(s) and os.path.isfile(played(s))):
             continue                   # (a draft is only priced, so every shot in it counts)
         todo.append(s)
     if not todo:
@@ -470,20 +613,27 @@ def cmd_clips(a):
     model = a.model or cfg.get("model")
     longest = cfg.get("max_seconds", 8)
     problems = []
-    vo = voiceover_file(a.project, data) if a.fit else None
+    vo = voiceover_file(a.project, data)
     if vo and not os.path.isfile(vo):
-        problems.append(f"the voiceover {os.path.relpath(vo, a.project)} doesn't exist (--fit needs its length "
-                        f"for the last shot)")
+        if a.fit:
+            problems.append(f"the voiceover {rel(vo, a.project)} doesn't exist (--fit needs its length for the "
+                            f"last shot)")
         vo = None
-    vo_len = duration(vo) if vo else 0    # as edit.py: an avatar video is the voiceover when there's no "vo"
+    # as edit.py: an avatar video is the voiceover when there's no "vo"
+    vo_len = duration(vo) if vo and (a.fit or ffmpeg()) else 0
 
     def num(s, k):
         v = s.get(k, 0)
-        return v if isinstance(v, (int, float)) else 0
+        return v if isinstance(v, (int, float)) and not isinstance(v, bool) else 0
+
+    def span(s, end):
+        """Seconds of clip the edit plays for a shot that runs to `end`: from its "in", at its "speed"."""
+        speed = num(s, "speed") if num(s, "speed") > 0 else 1.0
+        return max(0.0, (end - num(s, "start")) * speed + num(s, "in"))
 
     def need(s):
         end = max(num(s, "end"), vo_len) if s is shots[-1] else num(s, "end")   # the edit runs the last shot to the VO's end
-        return max(0.0, end - num(s, "start") + num(s, "in"))
+        return span(s, end)
 
     def length(s):
         """(seconds to ask for, spare seconds on top) for one clip."""
@@ -511,6 +661,18 @@ def cmd_clips(a):
         problems.append(quality_problem(p, "video", s.get("quality", default_q), model, s["id"]))
         if a.fit and not all(isinstance(s.get(k), (int, float)) for k in ("start", "end")):
             problems.append(f'{s["id"]}: needs a "start" and an "end" (in seconds) for --fit')
+        if s.get("freeze_ok"):
+            continue
+        plan = span(s, num(s, "end"))
+        if plan > longest + 0.25:      # a longer clip can't be bought: the edit would stop at a frozen frame
+            problems.append(f'{s["id"]} needs {plan:.1f}s of clip but a clip is at most {longest:g}s: the edit would '
+                            f'freeze its last {plan - longest:.1f}s. Split it into two shots that touch end to end, '
+                            f'shorten it' + (', set a smaller "in"' if num(s, "in") else "")
+                            + ', or set "freeze_ok": true on it')
+        elif s is shots[-1] and need(s) > longest + 0.25:
+            print(f"NOTE {s['id']} runs on to the voiceover's end ({need(s):.1f}s of clip), longer than one clip "
+                  f"({longest:g}s): the edit holds its last frame for {need(s) - longest:.1f}s. Fine after the last "
+                  f"word; if the voiceover says more after this shot, add a shot for it.")
     if no_prompt and len(no_prompt) == len([s for s in todo if not jobs[s["id"]]]) and draft:
         problems.append(f"{a.shots} is a draft with no video prompts: it can only be priced. Write shots.json "
                         f"(the shot plan) to make the clips.")
@@ -535,9 +697,12 @@ def cmd_clips(a):
         print(f"{p.label.split(' (')[0]} charges the same for any clip length, so --fit saves nothing here "
               f"(the edit trims each clip to its shot).")
     for s in todo:
-        if s.get("clip") and os.path.normpath(os.path.join(a.project, s["clip"])) != os.path.normpath(out_of(s)):
+        if played(s) and os.path.isfile(played(s)):
             print(f"{s['id']} plays {s['clip']} in the edit: a new clips/{s['id']}.mp4 needs generate.py lipsync "
                   f"again (priced on its own), or the edit keeps the old take.")
+        elif played(s):
+            print(f"{s['id']} plays {s['clip']} in the edit, which isn't made yet: once clips/{s['id']}.mp4 is in, "
+                  f"run generate.py lipsync to make it (priced on its own).")
 
     def price(s):
         q = s.get("quality", default_q)
@@ -547,7 +712,6 @@ def cmd_clips(a):
         if q in QUALITIES:
             est = p.estimate("video", q, model=model, audio=s.get("type") == "talking", **ask(p.estimate, s))
         return f'{s["id"]} ({q})', est
-    project = os.path.abspath(a.project)
     confirm([price(s) for s in todo], a.yes, project=project, problems=[key_problem(p)] + problems)
 
     def one(s):
@@ -557,7 +721,7 @@ def cmd_clips(a):
         frame = os.path.join(a.project, s["frame"]) if s.get("frame") else None
         r = p.video(s.get("video_prompt", ""), out, frame=frame, quality=s.get("quality", default_q),
                     audio=s.get("type") == "talking", model=model, **ask(p.video, s))
-        if s.get("clip") and os.path.normpath(os.path.join(a.project, s["clip"])) != os.path.normpath(out):
+        if played(s):
             r.note += (f" | the edit still plays {s['clip']}: run generate.py lipsync on this new take "
                        f"(or remove \"clip\" from {s['id']} to play it as it is)")
         return r
@@ -566,8 +730,8 @@ def cmd_clips(a):
 
 def cmd_voice(a):
     stop_on([file_problem(a.text_file, a.text_file, "--text-file")])
-    with open(a.text_file, encoding="utf-8") as f:
-        text = " ".join(l.strip() for l in f if l.strip())   # one block: blank lines make long pauses
+    # one block: blank lines make long pauses. read_text drops a byte-order mark (it would be sent and billed)
+    text = " ".join(l.strip() for l in read_text(a.text_file).splitlines() if l.strip())
     mode, p, cfg = route("voice", a.provider)
     quality = a.quality or cfg.get("quality", "standard")
     if mode != "api":
@@ -576,6 +740,7 @@ def cmd_voice(a):
                                                       "language": a.language or "the script's language"}, quality,
                 a.model or cfg.get("model"))
     project = find_project(a.out)
+    lock_project(project, a.yes)
     voice_id = a.voice or cfg.get("voice_id")
     model = a.model or cfg.get("model") or p.model_for("voice", quality)
     job = pending(p, a.out)
@@ -607,8 +772,9 @@ def cmd_lipsync(a):
     if mode != "api":
         handoff(mode, "lipsync", cfg, a.out, None, [a.video, a.audio],
                 {"job": "make the person in the video say the attached voiceover (keep the video's movement)"},
-                quality, a.model)
+                quality, a.model or cfg.get("model"))
     project = find_project(a.out)
+    lock_project(project, a.yes)
     job = pending(p, a.out)
     # The lip-synced clip is as long as the line. Lip-sync and avatar share a slot, so only --model picks the model.
     est = p.estimate("lipsync", quality, seconds=duration(a.audio), model=a.model) if quality in QUALITIES else None
@@ -626,8 +792,10 @@ def cmd_avatar(a):
     quality = a.quality or cfg.get("quality", "standard")
     if mode != "api":
         handoff(mode, "lipsync", cfg, a.out, a.prompt, [a.image, a.audio],
-                {"job": "turn the photo into a talking video that says the attached voiceover"}, quality, a.model)
+                {"job": "turn the photo into a talking video that says the attached voiceover"}, quality,
+                a.model or cfg.get("model"))        # an MCP or manual tool's pinned model (an API slot has none)
     project = find_project(a.out)
+    lock_project(project, a.yes)
     job = pending(p, a.out)
     talk = duration(a.audio)
     label = f"{os.path.basename(a.out)} ({mmss(talk)} of talking)"
@@ -648,6 +816,7 @@ def cmd_music(a):
                 {"length": length_for_tool(a.seconds) if a.seconds else "at least as long as the ad",
                  "vocals": "none (instrumental)"}, quality, a.model or cfg.get("model"))
     project = find_project(a.out)
+    lock_project(project, a.yes)
     model = a.model or cfg.get("model") or p.model_for("music", quality)
     job = pending(p, a.out)
     est = p.estimate("music", quality, seconds=a.seconds, model=model) if quality in QUALITIES else None
@@ -770,7 +939,9 @@ def run_parallel(items, fn, what, out=lambda it: it, label=None, project=None, p
     out(item) = the file the item writes; label(item) = its name in messages (the file name by default);
     p = the adapter, to tell a job the provider still has (a re-run collects it) from one that's gone."""
     label = label or (lambda it: os.path.basename(out(it)))
-    failed, maybe_paid, resumable, refused = 0, [], [], False
+    failed, maybe_paid, resumable, unsaved, lost, refused = 0, [], [], [], [], False
+    # A job an earlier run paid for and counted, but couldn't download: collecting it now costs nothing more.
+    counted = {out(it): bool((job_file(out(it)) or {}).get("counted")) for it in items}
     with cf.ThreadPoolExecutor(max_workers=4) as ex:
         futs = {ex.submit(fn, it): it for it in items}
         for f in cf.as_completed(futs):
@@ -791,8 +962,14 @@ def run_parallel(items, fn, what, out=lambda it: it, label=None, project=None, p
             except providers.ProviderError as e:
                 print(f"{name}: FAILED, {e}", flush=True)
                 failed += 1
+                made = getattr(e, "made", False)      # finished and paid for, but the file couldn't be saved
+                if made and not counted.get(out(it)):
+                    log_spend(f"{what} {name} (made, not downloaded)", getattr(e, "cost", None), project)
+                    mark_counted(out(it))
                 if pending(p, out(it)):        # the provider has the job: a re-run collects it
-                    resumable.append(name)
+                    (unsaved if made else resumable).append(name)
+                elif made:
+                    lost.append(name)
                 elif any(w in str(e) for w in MAYBE_PAID):
                     maybe_paid.append(name)
                 elif any(w in str(e).lower() for w in REFUSED):
@@ -806,20 +983,33 @@ def run_parallel(items, fn, what, out=lambda it: it, label=None, project=None, p
                 print(f"{name}: FAILED, {type(e).__name__}: {e}", flush=True)
                 failed += 1
                 continue
+            if counted.get(out(it)):
+                print(f"{name}: saved {r.files[0]} ({r.note}, paid for and counted by an earlier run)", flush=True)
+                continue
             log_spend(f"{what} {name}" + ("" if r.cost is not None else f" ({r.note})"), r.cost, project)
             cost = f"${r.cost:.3f}" if r.cost is not None else "cost unknown"
             print(f"{name}: saved {r.files[0]} ({r.note}, {cost})", flush=True)
     show_spent(project)
     if failed:
         msg = [f"{failed} job(s) failed."]
+
+        def them(names):
+            return "it" if len(names) == 1 else "them"
         if resumable:
             msg.append(f"{', '.join(resumable)}: the provider still has the job, so running the same command again "
                        f"collects it instead of paying for a new one.")
+        if unsaved:
+            msg.append(f"{', '.join(unsaved)}: made and paid for (already in the total above) but not saved: running "
+                       f"the same command again downloads {them(unsaved)} without paying again.")
+        if lost:
+            msg.append(f"{', '.join(lost)}: made and charged (already in the total above), but the provider no longer "
+                       f"has the file: running {them(lost)} again makes and pays for a new one.")
         if maybe_paid:
             msg.append(f"{', '.join(maybe_paid)} may have been made and charged anyway: check the provider before "
-                       f"running {'it' if len(maybe_paid) == 1 else 'them'} again.")
-        if failed > len(maybe_paid) + len(resumable):
-            msg.append(("The others are" if maybe_paid or resumable else "Failed jobs are") + " normally not charged.")
+                       f"running {them(maybe_paid)} again.")
+        if failed > len(maybe_paid) + len(resumable) + len(unsaved) + len(lost):
+            msg.append(("The others are" if maybe_paid or resumable or unsaved or lost else "Failed jobs are")
+                       + " normally not charged.")
             if refused:
                 msg.append("If it was a safety filter, soften the prompt (often a person + a medical detail) and retry.")
         print(" ".join(msg))
