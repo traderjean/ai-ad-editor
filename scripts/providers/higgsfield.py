@@ -4,7 +4,8 @@ Pattern for every model: upload local refs (presigned URL) -> POST /<model id> -
 Docs: https://docs.higgsfield.ai. A key is an ID plus a secret: HF_KEY="<id>:<secret>" (or HF_API_KEY + HF_API_SECRET).
 Only finished generations are charged; failed and blocked (nsfw) ones are refunded. The API reports no cost and
 has no balance call, so costs are estimates from Higgsfield's published price list (None where it shows none).
-Results and uploads are deleted after ~7 days, so results are downloaded straight away.
+Results and uploads are deleted after ~7 days, so results are downloaded straight away (a request an earlier run
+didn't collect, see _base.py <out>.job.json, is picked up from its status_url).
 The public API has no voice, music or lip-sync models: those slots stay on another provider (or the Higgsfield
 MCP, see SKILL.md).
 """
@@ -107,28 +108,55 @@ class Higgsfield(Provider):
         with_retries(lambda: http("PUT", d["upload_url"], headers=put, raw=data, timeout=300, want="bytes"))
         return d["public_url"]
 
-    def _run(self, model, inp, timeout=900):
+    def _run(self, model, inp, timeout=900, out=None):
         """Submit + poll. Returns the finished request JSON.
 
         Every submit carries an Idempotency-Key, so resending after a network error or a busy reply returns the
-        same request instead of making (and charging) a second one."""
-        idem = str(uuid.uuid4())
-        sub = self._req("POST", f"{API}/{model}", inp, headers={"Idempotency-Key": idem})
-        status_url = sub.get("status_url") or f"{API}/requests/{sub['request_id']}/status"
+        same request instead of making (and charging) a second one. With `out`, the request is kept in
+        <out>.job.json until the caller has saved the result, and a request an earlier run left there is
+        collected instead of submitting one (then `inp` is not used)."""
+        job = self.pending(out)
+        if job:                                   # an earlier run's request: poll that one, submit nothing
+            rid = job["id"]
+            status_url = job.get("poll") or f"{API}/requests/{rid}/status"
+        else:
+            idem = str(uuid.uuid4())
+            sub = self._req("POST", f"{API}/{model}", inp, headers={"Idempotency-Key": idem})
+            rid = sub.get("request_id")
+            status_url = sub.get("status_url") or (rid and f"{API}/requests/{rid}/status")
+            if not status_url:
+                raise ProviderError(f"Higgsfield took the job but sent back no request id ({str(sub)[:200]}). It may "
+                                    f"still finish (and be charged): check console.higgsfield.ai before running it again.")
+            self.remember(out, model, rid or status_url, status_url)
+        earlier = " (started by an earlier run)" if job else ""
         t0, every = time.time(), 2.0
         while True:
-            d = self._req("GET", status_url)
+            try:
+                d = self._req("GET", status_url)
+            except OutOfCredit:
+                raise
+            except ProviderError as e:
+                if job and e.code == 404:
+                    self.forget(out)
+                    raise ProviderError(f"Higgsfield has no request {rid}{earlier} any more (it keeps results about 7 "
+                                        f"days), so there is nothing to collect. Running it again makes a new one "
+                                        f"(paid).", code=404) from e
+                raise ProviderError(f"Lost track of Higgsfield request {rid} ({e}). It may still finish: "
+                                    f"{self.again(out, 'console.higgsfield.ai')}.", code=e.code) from e
             state = d.get("status")
             if state == "completed":
                 return d
+            if state in ("nsfw", "failed", "canceled"):
+                self.forget(out)                  # nothing to collect
             if state == "nsfw":
-                raise ProviderError("Higgsfield blocked this as unsafe (not charged). Soften the prompt or the "
-                                    "reference images (often a person + a medical or body detail) and retry.")
+                raise ProviderError(f"Higgsfield blocked this{earlier} as unsafe (not charged). Soften the prompt or "
+                                    f"the reference images (often a person + a medical or body detail) and retry.")
             if state in ("failed", "canceled"):
-                raise ProviderError(f"Higgsfield request {state} (not charged): {d.get('error') or 'no reason given'}")
+                raise ProviderError(f"Higgsfield request{earlier} {state} (not charged): "
+                                    f"{d.get('error') or 'no reason given'}")
             if time.time() - t0 > timeout:
-                raise ProviderError(f"Higgsfield request {sub.get('request_id')} still '{state}' after {timeout}s. "
-                                    f"It may still finish: check console.higgsfield.ai before running it again.")
+                raise ProviderError(f"Higgsfield request {rid} still '{state}' after {timeout}s. It may still finish: "
+                                    f"{self.again(out, 'console.higgsfield.ai')}.")
             time.sleep(every)
             every = min(every * 1.5, 10)
 
@@ -156,7 +184,8 @@ class Higgsfield(Provider):
 
     def image(self, prompt, out, refs=(), aspect="9:16", quality="standard", model=None):
         m = self.model_for("image", quality, model)
-        urls = [self.upload(p) for p in refs]
+        job = self.pending(out)                   # an earlier run's request: collected below, nothing is uploaded
+        urls = [] if job else [self.upload(p) for p in refs]
         res = IMAGE_RES.get(quality, "2k")
         inp = {"prompt": prompt, "aspect_ratio": aspect}
         if family(m) == "alibaba/qwen-image-3":   # two endpoints: edit (1-3 refs) or text-to-image
@@ -175,20 +204,23 @@ class Higgsfield(Provider):
             inp.update(resolution=res, quality="low" if quality == "draft" else "medium", image_urls=urls)
         elif urls:
             inp["image_urls"] = urls
-        d = self._run(m, inp, timeout=600)
+        d = self._run(m, inp, timeout=600, out=out)
         imgs = d.get("images") or []
         if not imgs or not imgs[0].get("url"):
-            raise ProviderError("Higgsfield returned no image")
+            self.forget(out)
+            raise ProviderError("Higgsfield finished but returned no image. Running it again makes a new one.")
         download(imgs[0]["url"], out)
-        return Result([out], self.estimate("image", quality, model=model), m)
+        self.forget(out)
+        return Result([out], self.estimate("image", quality, model=model), (job or {}).get("model", m) + self.earlier(job))
 
     def video(self, prompt, out, frame=None, seconds=8, aspect="9:16", quality="standard", audio=False, model=None):
         m = self.model_for("video", quality, model)
         if not frame:                             # no start frame: the text-to-video twin, which takes an aspect ratio
             m = m.replace("/image-to-video", "/text-to-video")
         fam, length = family(m), snap(m, seconds)
+        job = self.pending(out)
         inp = {"prompt": prompt + ("" if audio else NO_TEXT), "duration": length}
-        if frame:
+        if frame and not job:
             inp["image_url"] = self.upload(frame)
         if fam.startswith("kling-video/"):
             if fam in SOUND_SWITCH:
@@ -204,10 +236,12 @@ class Higgsfield(Provider):
                 inp["aspect_ratio"] = aspect
             if fam == "alibaba/wan-3.0":
                 inp["enable_thinking"] = False
-        d = self._run(m, inp, timeout=1800)
+        d = self._run(m, inp, timeout=1800, out=out)
         url = (d.get("video") or {}).get("url")
         if not url:
-            raise ProviderError("Higgsfield returned no video")
+            self.forget(out)
+            raise ProviderError("Higgsfield finished but returned no video. Running it again makes a new one.")
         download(url, out)
+        self.forget(out)
         est = self.estimate("video", quality, seconds=length, model=model)
-        return Result([out], est, f"{m}, {length}s")
+        return Result([out], est, f"{m}, {length}s" + self.earlier(job))

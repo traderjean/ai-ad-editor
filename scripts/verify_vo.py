@@ -7,17 +7,20 @@ _v<n> takes skipped). Files can be given
 from the project folder (final/ad1.mp4) or from the working folder (<project>/final/ad1.mp4).
 Each file is checked against the plan it was cut from: <project>_hookB_... -> shots_hookB.json,
 anything else -> shots.json (--shots forces one plan for every file).
-Two checks per file:
+Three checks per file with a voiceover:
   1. Waveform: every half second of the voiceover is in the final at the same moment (within 20ms).
      This catches dropped chunks, gaps and drift that a listen-through misses.
   2. Words: the final is transcribed and every word of the words file must be there, in order
      (as Whisper heard it in the voiceover, or as the script spells it, so a brand name it mishears
-     doesn't count as missing). When the waveform check passes, word differences are only noted:
-     the voiceover is provably all there, and Whisper hears mixed sound a little differently.
+     doesn't count as missing). When the waveform check passes, a word the final is heard saying
+     differently is checked against the voiceover itself: the words file must be the voiceover's.
+  3. Captions in sync: each word is heard in the final when the words file says (the captions are cut
+     from it), so a words file left over from another voiceover take fails.
 Prints PASS or FAIL for each file; exits 1 if any file fails.
-For ads with no separate voiceover file (the video tool's own voices) only the word check runs,
-against the words file given in the shots file. Text-only ads (every shot a text card) have no speech
-to check and pass.
+For ads with no voiceover file where the video tool's own voices speak ("use_clip_audio"), each talking
+shot's line (its "text", the approved script) must be heard inside that shot: a line cut off by its slot,
+changed or missing fails, named by shot id. Ads with no voice at all (no voiceover, avatar or clip voice,
+e.g. text cards) have no speech to check and pass.
 Not in English: set "language" in the shots file (e.g. "fr") or pass --language; the multilingual
 Whisper model is used instead of the English-only one.
 """
@@ -31,7 +34,7 @@ import sys
 import unicodedata
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from common import load_audio
+from common import clip_path, load_audio
 
 ap = argparse.ArgumentParser()
 ap.add_argument("project")
@@ -83,36 +86,106 @@ def plan_for(name):
     path = os.path.join(a.project, rel)
     if not os.path.exists(path):
         return rel, {}
-    with open(path, encoding="utf-8") as f:
-        return rel, json.load(f)
+    try:
+        with open(path, encoding="utf-8") as f:
+            return rel, json.load(f)
+    except (ValueError, UnicodeDecodeError) as e:
+        return rel, f"{rel} can't be read ({e}): fix it and run this again."
+
+
+def speaks(data):
+    """As qc.py: the ad has a voice when it has a voiceover, an avatar or a clip that keeps its own voice."""
+    return bool(data.get("vo")) or any(s.get("use_clip_audio") or s.get("type") == "avatar"
+                                       for s in data.get("shots") or [])
 
 
 plans, models = {}, {}
 
 
 def load_plan(rel, data):
-    """(voiceover samples or None, words, reference tokens, language) for a plan; None if it has no speech."""
+    """What a plan's finals are checked against: a dict, None if nothing is spoken, or the reason it can't be."""
+    if isinstance(data, str):
+        return data
+    if not isinstance(data, dict):
+        return f"{rel} isn't a shots file (it should hold {{\"shots\": [...]}}): fix it and run this again."
+    if not data and not a.vo:
+        return f"{rel} isn't in {a.project}: give the plan this file was cut from with --shots."
     vo_rel = a.vo or data.get("vo") or next((s["source"] for s in data.get("shots", [])      # as edit.py: an avatar
                                               if s.get("type") == "avatar" and s.get("source")), None)  # video is the VO
-    if data.get("shots") and not vo_rel and all(s.get("type") == "text" for s in data["shots"]):
-        return None                                       # text-only ad (option 5): nothing is spoken
-    vo = None
-    if vo_rel:
-        vp = os.path.join(a.project, vo_rel)
-        if not os.path.exists(vp):
-            sys.exit(f"The voiceover {vp} (from {'--vo' if a.vo else rel}) doesn't exist.")
-        vo = load_audio(vp, 8000)
-        if len(vo) < 8000:
-            sys.exit(f"The voiceover {vp} has less than a second of sound.")
-    wp = os.path.join(a.project, a.words or data.get("words", "words.json"))
+    words_rel = a.words or data.get("words")
+    hook = re.match(r"shots_(hook.*)\.json$", os.path.basename(rel))
+    if not words_rel and hook:          # as edit.py: a hook with its own voiceover has its own words file
+        own = f"words_{hook.group(1)}.json"
+        try:
+            with open(os.path.join(a.project, "shots.json"), encoding="utf-8") as f:
+                main_vo = json.load(f).get("vo")
+        except (OSError, ValueError, AttributeError):
+            main_vo = None
+        if os.path.exists(os.path.join(a.project, own)) or not vo_rel or \
+                os.path.normpath(vo_rel) != os.path.normpath(str(main_vo or "")):
+            words_rel = own
+    words_rel = words_rel or "words.json"
+    wp = os.path.join(a.project, words_rel)
+    lang = (a.language or data.get("language") or "en").lower()
+    if data.get("shots") and not vo_rel and not speaks(data):
+        # Nothing is spoken (option 5, text cards and stills), unless the voiceover was left out of the plan.
+        try:
+            with open(wp, encoding="utf-8") as f:
+                left = bool(json.load(f))
+        except (OSError, ValueError, UnicodeDecodeError):
+            left = False
+        if left:
+            return (f"{words_rel} is there but {rel} has no \"vo\": the ad was cut without its voiceover. Add "
+                    f"\"vo\": \"audio/vo.mp3\" to {rel} and run edit.py again (or, if this ad has no voice on "
+                    f"purpose, delete {words_rel}).")
+        return None
+    if not vo_rel:
+        # The video tool's own voices: the reference is each talking shot's line, not words.json, which edit.py
+        # transcribes from this very sound (comparing with it would prove nothing).
+        talk = [s for s in data.get("shots") or [] if s.get("use_clip_audio")]
+        odd = [str(s.get("id", "?")) for s in talk if not all(isinstance(s.get(k), (int, float)) for k in ("start", "end"))]
+        if odd:
+            return f"{', '.join(odd)} in {rel} need a \"start\" and an \"end\" (seconds): fix the plan and edit again."
+        return {"talk": talk, "lang": lang}
+    vp = os.path.join(a.project, vo_rel)
+    if not os.path.exists(vp):
+        return f"The voiceover {vp} (from {'--vo' if a.vo else rel}) doesn't exist."
+    vo = load_audio(vp, 8000)
+    if len(vo) < 8000:
+        return f"The voiceover {vp} has less than a second of sound."
+    m = re.match(r"words_(.+)\.json$", os.path.basename(words_rel))       # words_hookB.json <- script_hookB.txt
+    script = os.path.join(a.project, "inputs", f"script_{m.group(1)}.txt" if m else "script.txt")
+    redo = (f"python3 $S/transcribe.py {os.path.normpath(vp)} {a.project} --script "
+            + (os.path.normpath(script) if os.path.exists(script) else "<its script>")
+            + (f" --language {lang}" if lang != "en" else "")
+            + (f" --words-out {words_rel} --no-draft" if words_rel != "words.json" else ""))
+    if not a.words and not data.get("words") and words_rel != "words.json":
+        redo += f', and add "words": "{words_rel}" to {rel}'
     if not os.path.exists(wp):
-        sys.exit(f"No word timings at {wp}. Run transcribe.py first.")
-    with open(wp, encoding="utf-8") as f:
-        ref = json.load(f)
+        return f"No word timings at {wp}: time the voiceover first ({redo}), then run edit.py again."
+    try:
+        with open(wp, encoding="utf-8") as f:
+            ref = json.load(f)
+    except (ValueError, UnicodeDecodeError) as e:
+        return f"{wp} can't be read ({e}): fix it, or time the voiceover again ({redo})."
+    if not isinstance(ref, list) or not all(isinstance(w, dict) and "w" in w and isinstance(w.get("s"), (int, float))
+                                            for w in ref):
+        return f"{wp} isn't a words file (a list of {{\"w\", \"s\", \"e\"}}): time the voiceover again ({redo})."
     # What Whisper heard where transcribe.py took the script's spelling: the final is heard the same way.
     # Words with no letters (a dash, an emoji) can never be heard, so they don't count.
     tok = [(norm(x), i) for i, w in enumerate(ref) for x in str(w.get("heard", w["w"])).split() if norm(x)]
-    return vo, ref, tok, (a.language or data.get("language") or "en").lower()
+    if not tok:
+        return f"{wp} has no words in it, so the ad has no captions: time the voiceover again ({redo})."
+    return {"vo": vo, "vp": vp, "words": words_rel, "redo": redo, "ref": ref, "tok": tok, "lang": lang}
+
+
+def hear(path, lang):
+    """The words Whisper hears in a file: (letters only, start second, as heard)."""
+    name = a.model or ("small.en" if lang == "en" else "small")
+    if name not in models:
+        models[name] = WhisperModel(name, device="cpu", compute_type="int8")
+    segs, _ = models[name].transcribe(load_audio(path), language=lang, word_timestamps=True)
+    return [(norm(w.word), w.start, w.word.strip()) for s in segs for w in s.words if norm(w.word)]
 
 
 def as_written(ref, tok, i1, i2, got_part):
@@ -121,6 +194,26 @@ def as_written(ref, tok, i1, i2, got_part):
     entries = sorted({tok[k][1] for k in range(i1, i2)})
     written, heard = "".join(norm(ref[e]["w"]) for e in entries), "".join(got_part)
     return bool(written) and difflib.SequenceMatcher(None, written, heard).ratio() >= 0.85
+
+
+def align(plan, got):
+    """Line the words file up with the words heard: (words in place, [(i1, i2, j1, j2)] not in place,
+    [(word, heard)] index pairs that line up one for one)."""
+    tok, ref = plan["tok"], plan["ref"]
+    want, heard = [t for t, _ in tok], [g[0] for g in got]
+    matched, missing, pairs = 0, [], []
+    for kind, i1, i2, j1, j2 in difflib.SequenceMatcher(None, want, heard, autojunk=False).get_opcodes():
+        # the same words heard a little differently ("quizre" in the voiceover, "quizra" in the final) are there
+        if kind == "equal" or kind == "replace" and i2 - i1 == j2 - j1 and all(
+                difflib.SequenceMatcher(None, want[i1 + k], heard[j1 + k]).ratio() >= 0.75 for k in range(i2 - i1)):
+            matched += i2 - i1
+            pairs += [(i1 + k, j1 + k) for k in range(i2 - i1)]
+        elif kind == "replace" and (as_written(ref, tok, i1, i2, heard[j1:j2]) or difflib.SequenceMatcher(
+                None, "".join(want[i1:i2]), "".join(heard[j1:j2])).ratio() >= 0.85):    # "wrist well" -> "wristwell"
+            matched += i2 - i1
+        elif kind in ("delete", "replace"):
+            missing.append((i1, i2, j1, j2))
+    return matched, missing, pairs
 
 
 def waveform_check(vo, path, music):
@@ -135,13 +228,15 @@ def waveform_check(vo, path, music):
         if np.abs(w).max() < 300 / 32768:
             continue          # silence: nothing to match
         best = (-1, 0)
-        for lag in range(-1600, 1601, 40):
+        # From 0 outward, and only a clearly better match moves it: a music bed in the voiceover matches as
+        # well one beat early or late, which isn't a shift.
+        for lag in sorted(range(-1600, 1601, 40), key=abs):
             j = i + lag
             if j < 0 or j + n > len(fin):
                 continue
             seg = fin[j:j + n]
             c = float(np.dot(w, seg) / (np.linalg.norm(w) * np.linalg.norm(seg) + 1e-9))
-            if c > best[0]:
+            if c > best[0] + 0.05:
                 best = (c, lag / 8000)
         # music under the voice lowers the match a little; a dropped or shifted chunk drops it a lot
         if best[0] < (0.7 if music else 0.85) or abs(best[1]) > 0.02:
@@ -149,46 +244,167 @@ def waveform_check(vo, path, music):
     return errs
 
 
+def drift_check(plan, got, pairs):
+    """Why the captions are out of sync with the final, or None. Each word's start in the words file against
+    when the final is heard saying it: the same within a few hundredths of a second when the file is right."""
+    tok, ref = plan["tok"], plan["ref"]
+    # the first word heard of each entry starts when the entry does
+    drift = sorted(got[j][1] - ref[tok[i][1]]["s"] for i, j in pairs if i == 0 or tok[i - 1][1] != tok[i][1])
+    if len(drift) < 10:
+        return None
+    off = sorted(abs(d) for d in drift)
+    if off[len(off) // 2] <= 0.3 and sum(d > 0.5 for d in off) <= 0.1 * len(off):
+        return None
+    med = drift[len(drift) // 2]
+    return (f"captions are out of sync: {plan['words']} wasn't made from this voiceover (its words are heard "
+            f"{abs(med):.1f}s {'later' if med > 0 else 'earlier'} than it says, up to {off[-1]:.1f}s)")
+
+
+def check_lines(plan, got):
+    """Talking-characters route: (ok, words heard in place, words in the lines, lines to print). Each talking
+    shot's line must be heard inside its own slot (half a second either side for Whisper's timing)."""
+    talk = plan["talk"]
+    want = [(norm(x), x, n) for n, s in enumerate(talk)                     # [audio tags] aren't spoken
+            for x in re.sub(r"\[[^\]]*\]", " ", str(s.get("text") or "")).split() if norm(x)]
+    if not want:
+        if not got:
+            return True, 0, 0, ["(no speech heard, and no talking shot has a line in \"text\")"]
+        ids = ", ".join(s.get("id", "?") for s in talk)
+        return False, 0, 0, [f"{ids} keep their clip's voice but have no line in \"text\": write each talking shot's "
+                             "spoken line in its \"text\" so the words can be checked, then run this again."]
+    heard = [g[0] for g in got]
+    inplace, instead = [False] * len(want), {}
+    for kind, i1, i2, j1, j2 in difflib.SequenceMatcher(None, [w[0] for w in want], heard,
+                                                         autojunk=False).get_opcodes():
+        if kind == "insert":
+            continue
+        # the same words heard a little differently, one for one or as one run of letters ("Brew Haus" heard as
+        # "brew house"), are there
+        near = kind == "equal" or kind == "replace" and (i2 - i1 == j2 - j1 and all(
+            difflib.SequenceMatcher(None, want[i1 + k][0], heard[j1 + k]).ratio() >= 0.75 for k in range(i2 - i1))
+            or difflib.SequenceMatcher(None, "".join(w[0] for w in want[i1:i2]),
+                                       "".join(heard[j1:j2])).ratio() >= 0.8)
+        if near:
+            for k in range(i2 - i1):
+                j = j1 + min(k * (j2 - j1) // (i2 - i1), j2 - j1 - 1)
+                s = talk[want[i1 + k][2]]
+                inplace[i1 + k] = s["start"] - 0.5 <= got[j][1] <= s["end"] + 0.5
+        elif kind == "replace":
+            instead[i1] = " ".join(g[2] for g in got[j1:j2])
+    ok, out = True, []
+    for n, s in enumerate(talk):
+        idx = [k for k, w in enumerate(want) if w[2] == n]
+        if not idx:
+            continue
+        runs, run = [], []
+        for k in idx:
+            if not inplace[k]:
+                run.append(k)
+            elif run:
+                runs, run = runs + [run], []
+        if run:
+            runs.append(run)
+        miss = sum(len(r) for r in runs)
+        where = f"{s.get('id', '?')} ({s['start']:.1f}-{s['end']:.1f}s)"
+        if miss == len(idx):
+            ok = False
+            clip = clip_path(a.project, s) or os.path.join(a.project, "clips", f"{s.get('id')}.mp4")
+            out.append(f"{where}: none of its line was heard: " + (
+                f"{clip} doesn't exist, so the shot plays its start frame with no voice. Make the clip"
+                if not os.path.exists(clip) else f"is {clip} silent, or saying something else? Listen to it; remake "
+                                                 "it if it's wrong") + ", then run edit.py again.")
+            continue
+        bad = miss >= 2 and miss > 0.1 * len(idx) or max((len(r) for r in runs), default=0) >= 3
+        ok = ok and not bad
+        for r in runs:
+            words = " ".join(want[k][1] for k in r)
+            said = " ".join(instead[k] for k in r if k in instead)
+            if not bad:
+                what = f"heard as \"{said}\"" if said else "not heard"
+                out.append(f"{where}: \"{words}\" {what} (listen to that moment: if the clip really says that, "
+                           "tell the user)")
+            elif r[-1] == idx[-1]:
+                out.append(f"{where}: \"{words}\" not heard" + (f" (heard \"{said}\" instead)" if said else "") +
+                           ": the end of the line is cut off by the end of the shot, or the clip says something "
+                           "else. If the clip is still talking when the shot ends, lengthen the shot (or set a later "
+                           "\"in\"); otherwise remake the clip.")
+            else:
+                out.append(f"{where}: \"{words}\" " + (f"heard as \"{said}\"" if said else "not heard") +
+                           ": the clip says something else. Listen to it; remake it if the words are wrong.")
+    return ok, sum(inplace), len(want), out
+
+
 bad = 0
 for path in finals:
-    rel, data = plan_for(os.path.basename(path))
+    name = os.path.basename(path)
+    rel, data = plan_for(name)
     if rel not in plans:
         plans[rel] = load_plan(rel, data)
-    if plans[rel] is None:
-        print(f"PASS  {os.path.basename(path)}: no speech to check (text-only ad, {rel})")
+    plan = plans[rel]
+    tag = f" ({rel})" if rel != "shots.json" else ""
+    if plan is None:
+        print(f"PASS  {name}: no speech to check (no voiceover, avatar or clip voice in {rel})")
         continue
-    vo, ref, tok, lang = plans[rel]
-    name = a.model or ("small.en" if lang == "en" else "small")
-    if name not in models:
-        models[name] = WhisperModel(name, device="cpu", compute_type="int8")
-    segs, _ = models[name].transcribe(load_audio(path), language=lang, word_timestamps=True)
-    got = [norm(w.word) for s in segs for w in s.words if norm(w.word)]
-    want = [t for t, _ in tok]
-    sm = difflib.SequenceMatcher(None, want, got, autojunk=False)
-    matched, missing = 0, []
-    for op in sm.get_opcodes():
-        kind, i1, i2, j1, j2 = op
-        # the same words heard a little differently ("quizre" in the voiceover, "quizra" in the final) are there
-        if kind == "equal" or kind == "replace" and (i2 - i1 == j2 - j1 and all(
-                difflib.SequenceMatcher(None, want[i1 + k], got[j1 + k]).ratio() >= 0.75 for k in range(i2 - i1))
-                or as_written(ref, tok, i1, i2, got[j1:j2])):
-            matched += i2 - i1
-        elif kind in ("delete", "replace") and i2 - i1 > 2:
-            missing.append(op)
-    ratio = matched / max(len(tok), 1)
-    werr = waveform_check(vo, path, data.get("music")) if vo is not None else []
-    # With every moment of the voiceover's waveform in place, no word can be missing: words that differ are
-    # Whisper hearing the mixed sound differently, so they're noted. Without a voiceover file they decide.
-    vouched = vo is not None and not werr
-    ok = not werr and (vouched or ratio >= 0.93 and not missing)
+    if isinstance(plan, str):
+        bad += 1
+        print(f"FAIL  {name}: {plan}")
+        continue
+    got = hear(path, plan["lang"])
+    if "talk" in plan:
+        ok, matched, total, notes = check_lines(plan, got)
+        bad += not ok
+        print(f"{'PASS' if ok else 'FAIL'}  {name}: {matched}/{total} words of the talking shots' lines heard in their "
+              f"shots (no voiceover: checked against each talking shot's \"text\"){tag}")
+        for n in notes:
+            print("      " + n)
+        continue
+    ref, tok = plan["ref"], plan["tok"]
+    matched, missing, pairs = align(plan, got)
+    werr = waveform_check(plan["vo"], path, data.get("music"))
+    sync = drift_check(plan, got, pairs)
+    # With every moment of the voiceover's waveform in place, no word can be missing: a word the final is heard
+    # saying differently is Whisper hearing the mixed sound differently, unless the voiceover itself doesn't say
+    # it either: then the words file (and the captions cut from it) belongs to another voiceover or take.
+    stale = []
+    if not werr and missing:
+        if "heard" not in plan:
+            plan["heard"] = hear(plan["vp"], plan["lang"])
+        vo_missing = align(plan, plan["heard"])[1]
+        if any(j2 > j1 for _, _, j1, j2 in vo_missing) or sum(i2 - i1 for i1, i2, _, _ in vo_missing) >= 2:
+            stale = vo_missing
+    ok = not werr and not sync and not stale
     bad += not ok
-    wave = "no voiceover file" if vo is None else ("identical to the voiceover" if not werr else "MISMATCH")
-    print(f"{'PASS' if ok else 'FAIL'}  {os.path.basename(path)}: {matched}/{len(tok)} words in place, waveform {wave}"
-          + (f" ({rel})" if rel != "shots.json" else ""))
+    wave = "identical to the voiceover" if not werr else "MISMATCH"
+    print(f"{'PASS' if ok else 'FAIL'}  {name}: {matched}/{len(tok)} words in place, waveform {wave}{tag}")
     for e in werr[:8]:
         print(f"      voiceover missing or shifted at {e}")
-    for op in missing:
-        i, j = tok[op[1]][1], tok[op[2] - 1][1] + 1
-        what = "heard differently (the waveform shows it's there)" if vouched else "missing or changed"
-        print(f"      {what} at {ref[i]['s']:.1f}s: \"{' '.join(w['w'] for w in ref[i:j])}\"")
+    if werr:
+        print("      (a music bed inside the voiceover file itself can cause this: if the words are all in place, "
+              "listen to that moment)")
+    if sync:
+        print("      " + sync)
+    for i1, i2, j1, j2 in stale[:6]:
+        i, j = tok[i1][1], tok[i2 - 1][1] + 1
+        says = " ".join(g[2] for g in plan["heard"][j1:j2][:12]) + (" ..." if j2 - j1 > 12 else "")
+        print(f"      {plan['words']} doesn't match the voiceover at {ref[i]['s']:.1f}s: it has "
+              f"\"{' '.join(str(w['w']) for w in ref[i:j])}\", " +
+              (f"the voiceover says \"{says}\"" if says else "the voiceover doesn't say it"))
+    if len(stale) > 6:
+        print(f"      ... and {len(stale) - 6} more places")
+    if sync or stale:
+        print(f"      The captions come from {plan['words']}: time this voiceover again ({plan['redo']}), "
+              "then run edit.py again.")
+    for i1, i2, _, _ in ([] if stale else missing):
+        if i2 - i1 > 2:
+            i, j = tok[i1][1], tok[i2 - 1][1] + 1
+            what = "heard differently (the waveform shows it's there)" if not werr else "missing or changed"
+            print(f"      {what} at {ref[i]['s']:.1f}s: \"{' '.join(str(w['w']) for w in ref[i:j])}\"")
+    left = [w for w in ref if w.get("heard") is not None and w.get("heard") == w["w"]]
+    if left and not plan.get("told"):
+        plan["told"] = True     # once per plan
+        print(f"      note: {len(left)} word(s) in {plan['words']} are still as Whisper heard them, not as the script "
+              "says, so the captions show them that way: " +
+              ", ".join(f"{w['s']:.1f}s \"{w['w']}\"" for w in left[:6]) + (" ..." if len(left) > 6 else "") +
+              f". Fix each \"w\" in {plan['words']} (keep \"heard\"), or delete its \"heard\" if the voiceover really "
+              "says that, then run edit.py again.")
 sys.exit(1 if bad else 0)

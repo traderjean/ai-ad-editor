@@ -1,12 +1,15 @@
 """Word timings for a voiceover (or a talking-avatar clip) and a first draft of the shots.
 
-    transcribe.py <vo file> <project> [--script inputs/script.txt] [--max-shot 8] [--language fr]
-                  [--words-out words.json] [--no-draft]
+    transcribe.py <vo file> <project> [--script inputs/script.txt [--trust-script]] [--max-shot 8]
+                  [--language fr] [--words-out words.json] [--no-draft]
 
 Writes <project>/words.json and <project>/shots_draft.json (an existing words file is kept as
 <name>.bak). With --script, words Whisper misheard (names, brand words) are replaced by the script's
 spelling where the two line up one for one; anything it can't line up is printed so you can fix it
 by hand. What Whisper heard is kept as "heard" on those words, for verify_vo.py.
+--trust-script (for a voiceover generated from the script): what can't be lined up takes the script's
+words too, spread over the time Whisper heard something there, so nothing is left to fix by hand.
+If less than half of the script is heard (the wrong language, voiceover or script), nothing is written.
 Shots break at sentence ends or pauses and are never longer than --max-shot seconds
 (default: the video slot's max_seconds in providers.json).
 For a voiceover that isn't in English pass --language (e.g. fr): the multilingual Whisper model
@@ -28,12 +31,16 @@ ap = argparse.ArgumentParser()
 ap.add_argument("vo")
 ap.add_argument("project")
 ap.add_argument("--script", help="the approved script, to fix misheard words")
+ap.add_argument("--trust-script", action="store_true",
+                help="the voiceover was generated from the script: take the script's words everywhere")
 ap.add_argument("--max-shot", type=float)
 ap.add_argument("--language", type=str.lower, help="the voiceover's language code, e.g. fr (default: en)")
 ap.add_argument("--model", help="Whisper model (default: small.en for English, else small)")
 ap.add_argument("--words-out", default="words.json")
 ap.add_argument("--no-draft", action="store_true", help="only write the word timings")
 a = ap.parse_args()
+if a.trust_script and not a.script:
+    ap.error("--trust-script needs --script (the script the voiceover was generated from)")
 max_shot = a.max_shot or float(load_settings()["video"].get("max_seconds", 8))
 
 from faster_whisper import WhisperModel
@@ -51,13 +58,46 @@ def norm(t):
     return "".join(c for c in unicodedata.normalize("NFKD", t.casefold()) if c.isalnum())
 
 
+def spread(texts, t0, t1, heard):
+    """The script's words over t0..t1, evenly. What Whisper heard there goes on the first, for verify_vo.py."""
+    n = len(texts)
+    new = [{"w": x, "s": round(t0 + (t1 - t0) * k / n, 2), "e": round(t0 + (t1 - t0) * (k + 1) / n, 2), "heard": ""}
+           for k, x in enumerate(texts)]
+    new[0]["heard"] = heard
+    return new
+
+
 # ---- fix misheard words against the script ----
 if a.script:
     with open(a.script, encoding="utf-8-sig") as f:
-        script_words = re.sub(r"\[[^\]]*\]", " ", f.read()).split()   # drop [audio tags]
+        toks = re.sub(r"\[[^\]]*\]", " ", f.read()).split()   # drop [audio tags]
+    # French typography puts a space before ? ! : ; and inside « »: keep each mark on its word, so sentence ends
+    # still end draft shots and caption chunks ("encore ?" -> "encore?").
+    script_words = []
+    for t in toks:
+        if script_words and not norm(t) and all(c in "?!:;»….,)]”’%" for c in t):
+            script_words[-1] += t
+        elif script_words and all(c in "«¿¡“‘([" for c in script_words[-1]):
+            script_words[-1] += t
+        else:
+            script_words.append(t)
     sm = difflib.SequenceMatcher(None, [norm(w["w"]) for w in words], [norm(x) for x in script_words], autojunk=False)
-    fixed, unsure = 0, []
-    for op, i1, i2, j1, j2 in sm.get_opcodes():
+    ops = sm.get_opcodes()
+    # Too little of the script heard: the wrong language (an English-only model on French), voiceover or script.
+    lined_up = sum(j2 - j1 for op, i1, i2, j1, j2 in ops if op == "equal" or op == "replace" and (
+        i2 - i1 == j2 - j1 or "".join(norm(w["w"]) for w in words[i1:i2]) == "".join(norm(x) for x in script_words[j1:j2])))
+    total_script = sum(1 for x in script_words if norm(x))
+    if total_script and lined_up < 0.5 * total_script:
+        if not words:
+            sys.exit(f"No speech was heard in {a.vo}: check that it's the voiceover (with the voice in it). "
+                     "Nothing was written.")
+        lang = "English" if a.language in (None, "en") else f'"{a.language}"'
+        sys.exit(f"Only {100 * lined_up // total_script}% of the script was heard in {a.vo}. Is the voiceover in "
+                 f"{lang}? Pass --language <code> for another language (e.g. --language fr), check that this is the "
+                 f"right voiceover and script ({a.script}), or run without --script to time the words as heard. "
+                 "Nothing was written.")
+    fixed, unsure, tail = 0, [], []
+    for op, i1, i2, j1, j2 in ops:
         if op == "equal":       # same word: still take the script's spelling (brand capitals, punctuation)
             for k in range(i2 - i1):
                 words[i1 + k]["w"] = script_words[j1 + k]
@@ -65,14 +105,10 @@ if a.script:
             # Same letters, split differently ("sister -in -law", "drug store"): spread the script's words over
             # the heard time span. Marked so the second pass below can rebuild the list.
             span = words[i1:i2]
-            n = j2 - j1
-            t0, t1 = span[0]["s"], span[-1]["e"]
-            new = [{"w": script_words[j1 + k], "s": round(t0 + (t1 - t0) * k / n, 2),
-                    "e": round(t0 + (t1 - t0) * (k + 1) / n, 2), "heard": ""} for k in range(n)]
-            new[0]["heard"] = " ".join(w["w"] for w in span)
+            new = spread(script_words[j1:j2], span[0]["s"], span[-1]["e"], " ".join(w["w"] for w in span))
             for k, w in enumerate(span):
                 w["_replace"] = new if k == 0 else []
-            fixed += n
+            fixed += j2 - j1
         elif op == "replace" and i2 - i1 == j2 - j1:
             for k in range(i2 - i1):
                 words[i1 + k]["heard"] = words[i1 + k]["w"]
@@ -80,23 +116,67 @@ if a.script:
                 fixed += 1
         elif op == "insert" and not "".join(norm(x) for x in script_words[j1:j2]):
             pass                        # a dash or "&" in the script with nothing heard for it
+        elif op == "delete" and not "".join(norm(w["w"]) for w in words[i1:i2]):
+            for w in words[i1:i2]:      # a "%" or "-" heard on its own, already on the script's word
+                w["_replace"] = []
+        elif a.trust_script and op != "equal":
+            # Generated from the script, so the script is what it says: its words take the time Whisper heard
+            # something else there, or the gap between the words around them.
+            want = " ".join(script_words[j1:j2])
+            heard = " ".join(w["w"] for w in words[i1:i2])
+            if op == "delete":
+                for w in words[i1:i2]:
+                    w["_replace"] = []
+                print(f'  dropped words the script doesn\'t have at {words[i1]["s"]:.1f}s: "{heard}"')
+                continue
+            if op == "replace":
+                new = spread(script_words[j1:j2], words[i1]["s"], words[i2 - 1]["e"], heard)
+                for k, w in enumerate(words[i1:i2]):
+                    w["_replace"] = new if k == 0 else []
+            else:                       # insert: nothing heard for these words
+                n = j2 - j1
+                t0 = words[i1 - 1]["e"] if i1 else 0.0
+                t1 = words[i1]["s"] if i1 < len(words) else t0 + 0.3 * n
+                if t1 - t0 < 0.08 * n and i1:     # no room: take it from the end of the word before
+                    prev = words[i1 - 1]
+                    t0 = max(round((prev["s"] + prev["e"]) / 2, 2), round(t1 - 0.08 * n, 2))
+                    prev["e"] = t0
+                new = spread(script_words[j1:j2], t0, max(t1, t0), "")
+                if i1 < len(words):
+                    words[i1]["_before"] = words[i1].get("_before", []) + new
+                else:
+                    tail += new
+            fixed += j2 - j1
+            print(f'  took the script\'s words at {new[0]["s"]:.1f}s: "{want}" '
+                  + (f'(heard "{heard}")' if heard else "(heard nothing there)"))
         elif op != "equal":
             for w in words[i1:i2]:
                 w["heard"] = w["w"]     # kept when you fix the spelling by hand
             heard = " ".join(w["w"] for w in words[i1:i2])
             want = " ".join(script_words[j1:j2])
             where = words[min(i1, len(words) - 1)]["s"] if words else 0
-            unsure.append(f'{where:.1f}s  heard "{heard}"  script says "{want}"')
+            unsure.append(f'{where:.1f}s  ' + (f'heard "{heard}"' if heard else "heard nothing") + "  " +
+                          (f'script says "{want}"' if want else "the script doesn't have it"))
     rebuilt = []
     for w in words:
+        rebuilt += w.pop("_before", [])
         if "_replace" in w:
             rebuilt += w["_replace"]
         else:
             rebuilt.append(w)
-    words = rebuilt
+    words = rebuilt + tail
     print(f"Fixed {fixed} word(s) to match the script.")
     for u in unsure:
         print("  CHECK BY HAND:", u)
+    left = [w for w in words if w.get("heard") == w["w"]]
+    if left or unsure:
+        print(f"{len(left)} word(s) are still as Whisper heard them, not as the script says, and the captions show "
+              f"them that way. Fix each CHECK BY HAND line in {a.words_out}: change \"w\" and keep \"heard\", add a "
+              "missing word with \"heard\": \"\", delete a word the voiceover doesn't say, and delete \"heard\" from a "
+              "word it really says that way. Or, if the voiceover was generated from this script, run this again "
+              "with --trust-script.")
+    else:
+        print("Every word follows the script.")
 
 out = os.path.join(a.project, a.words_out)
 os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)     # e.g. audio/<id>_words.json

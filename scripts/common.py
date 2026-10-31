@@ -1,4 +1,4 @@
-"""Shared helpers: settings (providers.json), ffmpeg, durations, spend log."""
+"""Shared helpers: settings (providers.json), JSON files, ffmpeg, durations, project files, spend log and budget."""
 import csv
 import datetime
 import json
@@ -34,11 +34,24 @@ DEFAULT_SETTINGS = {
 
 # ---------- settings ----------
 
+def load_json(path, fix=""):
+    """A JSON file. A missing or broken one stops with its name (and the line), not a traceback."""
+    try:
+        with open(path, encoding="utf-8-sig") as f:      # -sig: Notepad's byte-order mark is fine
+            return json.load(f)
+    except FileNotFoundError:
+        sys.exit(f"{path} doesn't exist. {fix}".strip())
+    except (ValueError, UnicodeDecodeError) as e:
+        where = f" (line {e.lineno}: {e.msg})" if isinstance(e, json.JSONDecodeError) else ""
+        sys.exit(f"{path} is not valid JSON{where}. {fix}".strip())
+
+
 def load_settings():
     s = json.loads(json.dumps(DEFAULT_SETTINGS))
     if os.path.exists(SETTINGS):
-        with open(SETTINGS, encoding="utf-8") as f:
-            saved = json.load(f)
+        saved = load_json(SETTINGS, "Fix it, or delete it and run check_setup.py again.")
+        if not isinstance(saved, dict):
+            sys.exit(f"{SETTINGS} is not a settings file. Delete it and run check_setup.py again.")
         for k, v in saved.items():
             if isinstance(v, dict) and isinstance(s.get(k), dict):
                 s[k].update(v)
@@ -67,6 +80,15 @@ def ffmpeg():
         return None
 
 
+FFMPEG_ENCODERS = ("libx264", "aac")
+FFMPEG_FILTERS = ("ass", "loudnorm", "sidechaincompress", "zoompan", "freezedetect", "blackdetect", "tpad", "boxblur")
+
+
+def ffmpeg_fix(exe=None):
+    return (f"Your ffmpeg ({exe or ffmpeg()}) is a cut-down build. Install the full one: pip3 install imageio-ffmpeg "
+            f"(then take the other ffmpeg off your PATH) or brew install ffmpeg, and run check_setup.py again.")
+
+
 def run_ffmpeg(args):
     exe = ffmpeg()
     if not exe:
@@ -74,7 +96,8 @@ def run_ffmpeg(args):
     r = subprocess.run([exe, "-hide_banner", "-loglevel", "error", "-y"] + args, capture_output=True, text=True,
                        encoding="utf-8", errors="replace")
     if r.returncode != 0:
-        sys.exit("ffmpeg failed:\n" + r.stderr[-2000:])
+        hint = "\n" + ffmpeg_fix(exe) if "Unknown encoder" in r.stderr or "No such filter" in r.stderr else ""
+        sys.exit("ffmpeg failed:\n" + r.stderr[-2000:] + hint)
 
 
 def duration(path):
@@ -107,6 +130,33 @@ def mmss(seconds):
 # ---------- project files ----------
 
 CLIP_TYPES = ("clip", "veo", "talking")      # shot types made by the video slot ("veo" = old name for "clip")
+PROJECT_FILES = ("state.json", "shots.json", "budget.json", "brief.md")
+
+
+def find_project(path=None):
+    """The project folder a file belongs to: the nearest folder above it with state.json, shots.json,
+    budget.json or brief.md (never above the working folder when the file is inside it), else the
+    working folder (scripts are run from inside the project)."""
+    cwd = os.getcwd()
+    if path:
+        d = os.path.dirname(os.path.abspath(path))
+        inside = d == cwd or d.startswith(os.path.join(cwd, ""))
+        for _ in range(64 if inside else 4):
+            if any(os.path.exists(os.path.join(d, f)) for f in PROJECT_FILES):
+                return d
+            if (inside and d == cwd) or os.path.dirname(d) == d:
+                break
+            d = os.path.dirname(d)
+    return cwd
+
+
+def voiceover_file(project, data):
+    """The voiceover a plan is cut to: its "vo", else the first avatar shot's video (an AI avatar video is the
+    voiceover as well as the picture). None when there is neither."""
+    shots = data.get("shots") if isinstance(data.get("shots"), list) else []
+    rel = data.get("vo") or next((s["source"] for s in shots
+                                  if isinstance(s, dict) and s.get("type") == "avatar" and s.get("source")), None)
+    return os.path.join(project, rel) if rel else None
 
 
 def clip_path(project, shot):
@@ -161,20 +211,76 @@ def load_font(size, name=None, path=None):
 
 # ---------- spend ----------
 
-def check_spend(estimate):
-    """Block a run over the user's own per-run limit (if they set one). Unknown cost = no block."""
+BUDGET_FILE = "budget.json"     # {"budget": 15} in the project folder, written by check_setup.py --budget
+
+
+def project_name(project=None):
+    """The name spend_log.csv files a project under: its folder's name (the working folder by default)."""
+    return os.path.basename(os.path.abspath(project)) if project else os.path.basename(os.getcwd())
+
+
+def load_budget(project=None):
+    """The ad's budget in USD from <project>/budget.json, or None if none is set."""
+    path = os.path.join(project or os.getcwd(), BUDGET_FILE)
+    if not os.path.exists(path):
+        return None
+    b = load_json(path, "Set it again with: check_setup.py --budget <usd> (run inside the project).")
+    b = b.get("budget") if isinstance(b, dict) else None
+    if not isinstance(b, (int, float)) or isinstance(b, bool) or b < 0:
+        sys.exit(f"{path} should hold {{\"budget\": <usd>}}. Set it again with: check_setup.py --budget <usd>")
+    return float(b) or None
+
+
+def spend_rows():
+    """Every row of spend_log.csv as a dict (time, what, usd, project); [] when nothing was spent yet."""
+    if not os.path.exists(SPEND_LOG):
+        return []
+    with open(SPEND_LOG, newline="", encoding="utf-8", errors="replace") as f:
+        return [r for r in csv.DictReader(f) if r.get("what")]
+
+
+def spent(project=None):
+    """(USD spent on this project's runs of known cost, number of its runs of unknown cost)."""
+    name, usd, unknown = project_name(project), 0.0, 0
+    for r in spend_rows():
+        if (r.get("project") or "") != name:
+            continue
+        try:
+            usd += float(r["usd"])
+        except (TypeError, ValueError):
+            unknown += 1
+    return usd, unknown
+
+
+def check_spend(estimate, project=None):
+    """Block a run over the user's own per-run limit, or one that would take the ad past its budget
+    (budget.json in the project folder), if they set them. Unknown cost = no block."""
     limit = load_settings().get("spend_limit_per_run")
     if limit and estimate and estimate > limit:
         sys.exit(f"BLOCKED: this run (~${estimate:.2f}) is over your ${limit:.2f} per-run limit "
                  f"(spend_limit_per_run in providers.json). Split it up or raise the limit yourself.")
-
-
-def log_spend(what, amount, project=""):
-    if amount is None:
+    budget = load_budget(project)
+    if not budget:
         return
+    done, unknown = spent(project)
+    now = estimate or 0
+    also = f" ({unknown} earlier run(s) of unknown cost aren't counted)" if unknown else ""
+    if done + now > budget + 1e-9:
+        sys.exit(f"BLOCKED: this ad has spent ${done:.2f} and this run (~${now:.2f}) would take it to "
+                 f"${done + now:.2f}, over its ${budget:.2f} budget{also}. Ask the user: raise it with "
+                 f"check_setup.py --budget <usd> (run inside the project), or make less.")
+    if estimate is None:
+        print(f"This ad: ${done:.2f} spent of your ${budget:.2f} budget; this run's cost is unknown{also}")
+    else:
+        print(f"This ad: ${done:.2f} spent + ${now:.2f} now = ${done + now:.2f} of your ${budget:.2f} budget{also}")
+
+
+def log_spend(what, amount, project=None):
+    """One row per paid job; a job of unknown cost gets a row too, with usd left empty."""
     new = not os.path.exists(SPEND_LOG)
     with open(SPEND_LOG, "a", newline="", encoding="utf-8") as f:
         w = csv.writer(f, lineterminator="\n")     # quotes a field with a comma in it (a label, a project path)
         if new:
             w.writerow(["time", "what", "usd", "project"])
-        w.writerow([datetime.datetime.now().isoformat(timespec="seconds"), what, f"{amount:.3f}", project])
+        w.writerow([datetime.datetime.now().isoformat(timespec="seconds"), what,
+                    "" if amount is None else f"{amount:.3f}", project_name(project)])
